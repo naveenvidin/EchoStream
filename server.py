@@ -1,74 +1,70 @@
-import socket, struct, cv2, torch, time, csv
+import subprocess
 import numpy as np
+import cv2
+import socket
 from ultralytics import YOLO
+import torch
 
-# === CONFIGURATION ===
-MODE = "SMART"  # Toggle between "SMART" and "BASELINE"
+STREAM_PORT = 5004
+CONTROL_PORT = 6000
+
+WIDTH = 640
+HEIGHT = 480
+
 device = 'mps' if torch.backends.mps.is_available() else 'cpu'
-# =====================
+model = YOLO("yolov8n.pt").to(device)
 
-model = YOLO('yolov8n.pt').to(device)
-server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-server_socket.bind(('0.0.0.0', 9999))
-server_socket.listen(1)
+# ---------- CONTROL SOCKET ----------
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.bind(("0.0.0.0", CONTROL_PORT))
+server.listen(1)
+print("Waiting for camera control connection...")
+conn, addr = server.accept()
+print("Camera connected for control.")
 
-# Accuracy Logging
-log_file = open(f'accuracy_log_{MODE}.csv', mode='w', newline='')
-log_writer = csv.writer(log_file)
-log_writer.writerow(['Timestamp', 'Avg_Confidence', 'Object_Count', 'Mode'])
+# ---------- START FFMPEG DECODER ----------
+ffmpeg = subprocess.Popen([
+    "ffmpeg",
+    "-loglevel", "error",
+    "-i", f"udp://127.0.0.1:{STREAM_PORT}",
+    "-f", "rawvideo",
+    "-pix_fmt", "bgr24",
+    "-"
+], stdout=subprocess.PIPE)
 
-print(f"Server [{MODE} MODE] active. Waiting for Camera...")
+print("Receiving video stream...")
 
 try:
-    conn, addr = server_socket.accept()
-    data = b""
-    payload_size = struct.calcsize("Q")
-    start_time = time.time()
-
     while True:
-        # --- RECEIVE DATA ---
-        while len(data) < payload_size:
-            packet = conn.recv(8192)
-            if not packet: break
-            data += packet
-        if len(data) < payload_size: break
-        packed_msg_size = data[:payload_size]
-        data = data[payload_size:]; msg_size = struct.unpack("Q", packed_msg_size)[0]
-        while len(data) < msg_size:
-            packet = conn.recv(8192); data += packet
-        frame_data = data[:msg_size]; data = data[msg_size:]
+        raw = ffmpeg.stdout.read(WIDTH * HEIGHT * 3)
+        if not raw:
+            continue
 
-        # --- INFERENCE ---
-        nparr = np.frombuffer(frame_data, np.uint8)
-        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        if frame is not None:
-            results = model(frame, verbose=False, device=device)
-            
-            # Calculate Accuracy Metrics
-            confidences = [box.conf[0].item() for r in results for box in r.boxes]
-            avg_conf = np.mean(confidences) if confidences else 0
-            obj_count = len(confidences)
-            
-            # Logic for Feedback
-            if MODE == "BASELINE":
-                feedback = "HIGH" # Ground Truth mode
-            else:
-                feedback = "HIGH" if any(c < 0.65 for c in confidences) or obj_count == 0 else "LOW"
+        frame = np.frombuffer(raw, np.uint8).reshape((HEIGHT, WIDTH, 3))
 
-            conn.sendall(feedback.encode())
-            log_writer.writerow([time.time() - start_time, avg_conf, obj_count, feedback])
+        # ---------- YOLO INFERENCE ----------
+        results = model(frame, verbose=False, device=device)
 
-            # Visuals
-            annotated_frame = results[0].plot()
-            cv2.putText(annotated_frame, f"MODE: {MODE} | Send: {feedback}", (20, 40), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.imshow("Server AI View", annotated_frame)
+        human_detected = False
+        for r in results:
+            for box in r.boxes:
+                if int(box.cls[0]) == 0:  # class 0 = person
+                    human_detected = True
 
-        if cv2.waitKey(1) & 0xFF == ord('q'): break
+        feedback = "HIGH" if human_detected else "LOW"
+        conn.sendall(feedback.encode())
+
+        annotated = results[0].plot()
+        cv2.putText(annotated, f"MODE: {feedback}", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+        cv2.imshow("Server YOLO View", annotated)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
 finally:
-    log_file.close()
+    ffmpeg.terminate()
     conn.close()
-    server_socket.close()
+    server.close()
     cv2.destroyAllWindows()
