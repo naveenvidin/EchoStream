@@ -1,78 +1,39 @@
-import cv2
-import subprocess
-import socket
-import threading
+import cv2, socket, struct, time, csv
 
-STREAM_PORT = 5004
-CONTROL_PORT = 6000
+# === CONFIGURATION ===
+TEST_NAME = "SMART" # Change this to match the server mode
+# =====================
 
-WIDTH = 640
-HEIGHT = 480
-FPS = 30
+client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+client_socket.connect(('localhost', 9999))
 
-CRF_HIGH = 18
-CRF_LOW = 30
-
-mode = "LOW"
-current_crf = CRF_LOW
-
-# ---------- CONTROL LISTENER ----------
-def control_listener():
-    global mode
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect(("127.0.0.1", CONTROL_PORT))
-    while True:
-        feedback = sock.recv(1024).decode()
-        if feedback in ["HIGH", "LOW"]:
-            mode = feedback
-
-threading.Thread(target=control_listener, daemon=True).start()
-
-# ---------- START FFMPEG ----------
-def start_ffmpeg(crf):
-    print(f"Starting encoder with CRF {crf}")
-    return subprocess.Popen([
-        "ffmpeg",
-        "-loglevel", "error",
-        "-f", "rawvideo",
-        "-pix_fmt", "bgr24",
-        "-s", f"{WIDTH}x{HEIGHT}",
-        "-r", str(FPS),
-        "-i", "-",
-        "-an",
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-tune", "zerolatency",
-        "-crf", str(crf),
-        "-f", "mpegts",
-        f"udp://127.0.0.1:{STREAM_PORT}"
-    ], stdin=subprocess.PIPE)
+log_file = open(f'bandwidth_log_{TEST_NAME}.csv', mode='w', newline='')
+log_writer = csv.writer(log_file)
+log_writer.writerow(['Timestamp', 'Size_KB', 'Quality'])
 
 cap = cv2.VideoCapture(0)
-ffmpeg = start_ffmpeg(current_crf)
+quality = 15; total_bytes = 0; frame_count = 0; start_time = time.time()
 
 try:
     while True:
         ret, frame = cap.read()
-        if not ret:
-            break
+        if not ret: break
+        frame = cv2.resize(frame, (640, 480))
 
-        # Check if CRF needs changing
-        desired_crf = CRF_HIGH if mode == "HIGH" else CRF_LOW
-        if desired_crf != current_crf:
-            ffmpeg.stdin.close()
-            ffmpeg.terminate()
-            ffmpeg.wait()
-            current_crf = desired_crf
-            ffmpeg = start_ffmpeg(current_crf)
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+        _, img_encoded = cv2.imencode('.jpg', frame, encode_param)
+        data = img_encoded.tobytes()
 
-        ffmpeg.stdin.write(frame.tobytes())
+        # Log & Send
+        log_writer.writerow([time.time() - start_time, len(data)/1024, quality])
+        total_bytes += len(data); frame_count += 1
+        client_socket.sendall(struct.pack("Q", len(data)) + data)
+        
+        feedback = client_socket.recv(1024).decode()
+        quality = 90 if feedback == "HIGH" else 15
 
-        cv2.imshow("Camera (Local View)", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
+        cv2.imshow("Camera Node", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'): break
 finally:
-    cap.release()
-    ffmpeg.terminate()
-    cv2.destroyAllWindows()
+    print(f"\nTest {TEST_NAME} Complete. Avg Size: {(total_bytes/1024)/frame_count:.2f} KB")
+    cap.release(); client_socket.close(); log_file.close(); cv2.destroyAllWindows()
