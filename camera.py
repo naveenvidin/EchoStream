@@ -1,39 +1,81 @@
-import cv2, socket, struct, time, csv
+import cv2
+import ffmpeg
+import socket
 
-# === CONFIGURATION ===
-TEST_NAME = "SMART" # Change this to match the server mode
-# =====================
+WIDTH, HEIGHT = 640, 480
+FPS = 30
+SERVER_IP = "127.0.0.1"
+VIDEO_PORT = 10000
+CONTROL_PORT = 10001
 
-client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-client_socket.connect(('localhost', 9999))
+current_crf = 28
 
-log_file = open(f'bandwidth_log_{TEST_NAME}.csv', mode='w', newline='')
-log_writer = csv.writer(log_file)
-log_writer.writerow(['Timestamp', 'Size_KB', 'Quality'])
+print("[CAMERA] Connecting control socket...")
+control_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+control_sock.connect((SERVER_IP, CONTROL_PORT))
+print("[CAMERA] Control connected.")
+
+def start_encoder(crf):
+    print(f"[CAMERA] Starting encoder with CRF {crf}")
+    return (
+        ffmpeg
+        .input(
+            'pipe:',
+            format='rawvideo',
+            pix_fmt='bgr24',
+            s=f'{WIDTH}x{HEIGHT}',
+            framerate=FPS
+        )
+        .output(
+            f'tcp://{SERVER_IP}:{VIDEO_PORT}?listen=0',
+            format='mpegts',
+            vcodec='libx264',
+            preset='ultrafast',
+            tune='zerolatency',
+            pix_fmt='yuv420p',
+            g=30,
+            bf=0,
+            crf=crf
+        )
+        .run_async(pipe_stdin=True)
+    )
+
+encoder = start_encoder(current_crf)
 
 cap = cv2.VideoCapture(0)
-quality = 15; total_bytes = 0; frame_count = 0; start_time = time.time()
+if not cap.isOpened():
+    raise RuntimeError("Camera failed to open")
 
 try:
     while True:
         ret, frame = cap.read()
-        if not ret: break
-        frame = cv2.resize(frame, (640, 480))
+        if not ret:
+            break
 
-        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
-        _, img_encoded = cv2.imencode('.jpg', frame, encode_param)
-        data = img_encoded.tobytes()
+        frame = cv2.resize(frame, (WIDTH, HEIGHT))
+        encoder.stdin.write(frame.tobytes())
 
-        # Log & Send
-        log_writer.writerow([time.time() - start_time, len(data)/1024, quality])
-        total_bytes += len(data); frame_count += 1
-        client_socket.sendall(struct.pack("Q", len(data)) + data)
-        
-        feedback = client_socket.recv(1024).decode()
-        quality = 90 if feedback == "HIGH" else 15
+        # ---- Check for CRF update ----
+        control_sock.setblocking(False)
+        try:
+            data = control_sock.recv(1024)
+            if data:
+                new_crf = int(data.decode())
+                if new_crf != current_crf:
+                    current_crf = new_crf
+                    encoder.stdin.close()
+                    encoder.wait()
+                    encoder = start_encoder(current_crf)
+        except:
+            pass
 
         cv2.imshow("Camera Node", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'): break
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
 finally:
-    print(f"\nTest {TEST_NAME} Complete. Avg Size: {(total_bytes/1024)/frame_count:.2f} KB")
-    cap.release(); client_socket.close(); log_file.close(); cv2.destroyAllWindows()
+    encoder.stdin.close()
+    encoder.wait()
+    cap.release()
+    control_sock.close()
+    cv2.destroyAllWindows()
