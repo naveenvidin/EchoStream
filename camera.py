@@ -1,50 +1,54 @@
 import cv2
-import ffmpeg
 import socket
+import struct
+import numpy as np
+import ffmpeg
 
-WIDTH, HEIGHT = 640, 480
-FPS = 30
-SERVER_IP = "127.0.0.1"
-VIDEO_PORT = 10000
-CONTROL_PORT = 10001
+# === CONFIGURATION ===
+SERVER_IP = 'localhost'
+PORT = 9999
+current_crf = 45  # 0 (best) → 51 (worst)
 
-current_crf = 28
+cap = cv2.VideoCapture(0)
 
-print("[CAMERA] Connecting control socket...")
-control_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-control_sock.connect((SERVER_IP, CONTROL_PORT))
-print("[CAMERA] Control connected.")
+client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+client_socket.connect((SERVER_IP, PORT))
 
-def start_encoder(crf):
-    print(f"[CAMERA] Starting encoder with CRF {crf}")
-    return (
+
+def ffmpeg_compress(frame, crf_val):
+    """
+    Compress a single frame using ffmpeg-python.
+    """
+
+    height, width, _ = frame.shape
+    raw_bytes = frame.tobytes()
+
+    # Map CRF-like value to MJPEG quality scale
+    bitrate_val = str(max(1, int(crf_val / 2)))
+
+    process = (
         ffmpeg
         .input(
             'pipe:',
             format='rawvideo',
             pix_fmt='bgr24',
-            s=f'{WIDTH}x{HEIGHT}',
-            framerate=FPS
+            s=f'{width}x{height}'
         )
         .output(
-            f'tcp://{SERVER_IP}:{VIDEO_PORT}?listen=0',
-            format='mpegts',
-            vcodec='libx264',
-            preset='ultrafast',
-            tune='zerolatency',
-            pix_fmt='yuv420p',
-            g=30,
-            bf=0,
-            crf=crf
+            'pipe:',
+            vframes=1,
+            format='mjpeg',
+            **{'b:v': bitrate_val}
         )
-        .run_async(pipe_stdin=True)
+        .global_args('-loglevel', 'quiet')
+        .run_async(pipe_stdin=True, pipe_stdout=True)
     )
 
-encoder = start_encoder(current_crf)
+    out, _ = process.communicate(input=raw_bytes)
+    return out
 
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    raise RuntimeError("Camera failed to open")
+
+print("Camera Node: FFmpeg-Python Adaptive Controller Active.")
 
 try:
     while True:
@@ -52,30 +56,43 @@ try:
         if not ret:
             break
 
-        frame = cv2.resize(frame, (WIDTH, HEIGHT))
-        encoder.stdin.write(frame.tobytes())
+        frame = cv2.resize(frame, (640, 480))
 
-        # ---- Check for CRF update ----
-        control_sock.setblocking(False)
+        # Compress frame using FFmpeg wrapper
+        data = ffmpeg_compress(frame, current_crf)
+
+        # Send compressed frame
+        client_socket.sendall(struct.pack("Q", len(data)) + data)
+
+        # Receive AI metric
+        response = client_socket.recv(1024).decode()
+
         try:
-            data = control_sock.recv(1024)
-            if data:
-                new_crf = int(data.decode())
-                if new_crf != current_crf:
-                    current_crf = new_crf
-                    encoder.stdin.close()
-                    encoder.wait()
-                    encoder = start_encoder(current_crf)
-        except:
-            pass
+            conf_score = float(response)
 
-        cv2.imshow("Camera Node", frame)
+            # Inverse Mapping:
+            # High confidence → high CRF (lower quality)
+            # Low confidence → low CRF (higher quality)
+            current_crf = int((1.0 - conf_score) * 50)
+            current_crf = max(5, min(50, current_crf))
+
+        except ValueError:
+            conf_score = 0.0
+
+        # UI
+        cv2.putText(frame, f"FFmpeg CRF Knob: {current_crf}",
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (255, 0, 0),
+                    2)
+
+        cv2.imshow("Edge Node: Adaptive Frame Processing", frame)
+
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
 finally:
-    encoder.stdin.close()
-    encoder.wait()
     cap.release()
-    control_sock.close()
+    client_socket.close()
     cv2.destroyAllWindows()
