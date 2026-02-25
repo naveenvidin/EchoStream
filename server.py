@@ -2,9 +2,13 @@ import socket, struct, cv2, torch
 import numpy as np
 from ultralytics import YOLO
 
-device = 'mps' if torch.backends.mps.is_available() else 'cpu'
-model = YOLO('yolov8n.pt').to(device)
-SHOW_SERVER_WINDOW = False
+
+device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+print(f"Using device: {device}")
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+model = YOLO('yolo26n.pt').to(device)
+
 
 server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -39,13 +43,11 @@ try:
             confidences = [box.conf[0].item() for r in results for box in r.boxes]
             
             # Send Metric: Min confidence score (Inference Engine logic)
-            min_conf = min(confidences) if confidences else 0.5
-            conn.sendall(struct.pack("!f", float(min_conf)))
+            min_conf = min(confidences) if confidences else 1.0
+            conn.sendall(str(round(min_conf, 2)).encode())
 
-            if SHOW_SERVER_WINDOW:
-                cv2.imshow("Edge Server: YOLO Inference", results[0].plot())
+            cv2.imshow("Edge Server: YOLO Inference", results[0].plot())
             
-        if SHOW_SERVER_WINDOW and cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        if cv2.waitKey(1) & 0xFF == ord('q'): break
 finally:
     conn.close(); server_socket.close(); cv2.destroyAllWindows()

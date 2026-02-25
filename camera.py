@@ -1,186 +1,180 @@
 import cv2
 import socket
 import struct
-import ffmpeg
-import time
+import subprocess
 import numpy as np
-from motion_masker import OpticalFlowMasker
+import time
+import shutil
 
 # === CONFIGURATION ===
-SERVER_IP = 'localhost'
+SERVER_IP = '192.168.7.203'
 PORT = 9999
-current_crf = 45  # 0 (best) → 51 (worst)
-LOG_BANDWIDTH_EVERY_SEC = 60
-FIXED_CRF = None  # Set None to enable adaptive CRF.
 
-cap = cv2.VideoCapture(0)
+# CRF-like knob (0~51 in ffmpeg CRF world; here we map roughly to JPEG bitrate quality behavior)
+current_crf = 45
 
-client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-client_socket.connect((SERVER_IP, PORT))
-masker = OpticalFlowMasker(motion_threshold=3.0, min_contour_area=1200)
+# Headless mode on Pi (no GUI)
+HEADLESS = True
+
+# Optional: choose camera index (0 is most common for USB webcam)
+CAMERA_INDEX = 0
+
+# Frame size to send
+FRAME_W = 640
+FRAME_H = 480
 
 
-def recv_exact(sock, size):
+def find_ffmpeg():
+    """Return ffmpeg executable path if available, else None."""
+    ff = shutil.which("ffmpeg")
+    return ff
+
+
+def connect_with_retry(server_ip, port, retries=30, delay_sec=1.0):
+    """Retry TCP connect so camera node can start before/after server."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    last_err = None
+    for i in range(1, retries + 1):
+        try:
+            print(f"[CONNECT] Try {i}/{retries} -> {server_ip}:{port}")
+            sock.connect((server_ip, port))
+            print("[CONNECT] Connected to server.")
+            return sock
+        except OSError as e:
+            last_err = e
+            time.sleep(delay_sec)
+    raise RuntimeError(f"Cannot connect to server {server_ip}:{port}. Last error: {last_err}")
+
+
+def ffmpeg_compress(frame, crf_val, ffmpeg_path):
     """
-    Receive exactly `size` bytes from TCP stream.
+    Compress one frame using FFmpeg -> MJPEG bytes (single frame).
     """
-    chunks = []
-    received = 0
-    while received < size:
-        chunk = sock.recv(size - received)
-        if not chunk:
-            raise ConnectionError("Socket closed while receiving confidence metric.")
-        chunks.append(chunk)
-        received += len(chunk)
-    return b"".join(chunks)
-
-
-def ffmpeg_compress(frame, crf_val):
-    """
-    Compress a single frame using ffmpeg-python.
-    """
-
+    raw_frame = frame.tobytes()
     height, width, _ = frame.shape
-    raw_bytes = frame.tobytes()
 
-    # Map CRF-like value to MJPEG quantizer (2=best, 31=worst).
-    mjpeg_q = int(np.interp(float(crf_val), [0.0, 51.0], [2.0, 31.0]))
-    mjpeg_q = max(2, min(31, mjpeg_q))
+    # We use MJPEG single-frame output and map crf_val to a bitrate-ish knob.
+    ffmpeg_cmd = [
+        ffmpeg_path,
+        '-y',
+        '-f', 'rawvideo',
+        '-vcodec', 'rawvideo',
+        '-s', f'{width}x{height}',
+        '-pix_fmt', 'bgr24',
+        '-i', '-',          # stdin
+        '-vframes', '1',
+        '-b:v', str(max(1, int(crf_val / 2))),  # simple mapping
+        '-f', 'mjpeg',
+        '-loglevel', 'quiet',
+        '-'                 # stdout
+    ]
 
-    process = (
-        ffmpeg
-        .input(
-            'pipe:',
-            format='rawvideo',
-            pix_fmt='bgr24',
-            s=f'{width}x{height}'
-        )
-        .output(
-            'pipe:',
-            vframes=1,
-            format='mjpeg',
-            **{'q:v': str(mjpeg_q)}
-        )
-        .global_args('-loglevel', 'quiet')
-        .run_async(pipe_stdin=True, pipe_stdout=True)
+    process = subprocess.Popen(
+        ffmpeg_cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
     )
+    out, err = process.communicate(input=raw_frame)
 
-    out, _ = process.communicate(input=raw_bytes)
+    if process.returncode != 0 or not out:
+        err_msg = err.decode(errors='ignore') if err else "Unknown ffmpeg error"
+        raise RuntimeError(f"FFmpeg compression failed: {err_msg}")
+
     return out
 
 
-def estimate_full_frame_bytes(frame, crf_val):
-    """
-    Estimate full-frame JPEG size (for baseline comparison).
-    """
-    jpeg_quality = max(5, min(95, 100 - int(crf_val) * 2))
-    ok, encoded = cv2.imencode(
-        ".jpg",
-        frame,
-        [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality]
-    )
-    return len(encoded) if ok else 0
+def main():
+    global current_crf
 
+    ffmpeg_path = find_ffmpeg()
+    if not ffmpeg_path:
+        raise RuntimeError("ffmpeg not found. Install it on Pi: sudo apt install -y ffmpeg")
 
-print("Camera Node: FFmpeg-Python Adaptive Controller Active.")
+    print(f"[INIT] ffmpeg: {ffmpeg_path}")
 
-try:
-    conf_score = 0.0
-    header_bytes = struct.calcsize("Q")
-    interval_start_ts = time.time()
-    interval_sent_bytes = 0
-    interval_baseline_bytes = 0
+    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open camera index {CAMERA_INDEX}. Try 1 or check webcam connection.")
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    # Set camera resolution (best effort)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
 
-        frame = cv2.resize(frame, (640, 480))
-        masked_frame, roi_ratio = masker.apply(frame)
-        active_crf = FIXED_CRF if FIXED_CRF is not None else current_crf
+    client_socket = None
+    frame_count = 0
+    t0 = time.time()
 
-        # Compress masked frame and send it to server
-        data = ffmpeg_compress(masked_frame, active_crf)
-        sent_bytes = len(data) + header_bytes
+    try:
+        client_socket = connect_with_retry(SERVER_IP, PORT, retries=60, delay_sec=1.0)
+        print("[RUN] Camera Node: FFmpeg Subprocess Controller Active (Headless).")
 
-        # Baseline: what we'd approximately send if we streamed full frame
-        full_est_bytes = estimate_full_frame_bytes(frame, active_crf) + header_bytes
-        interval_sent_bytes += sent_bytes
-        interval_baseline_bytes += full_est_bytes
+        while True:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                print("[WARN] Failed to read frame from camera.")
+                time.sleep(0.1)
+                continue
 
-        # Send compressed frame
-        client_socket.sendall(struct.pack("Q", len(data)) + data)
+            frame = cv2.resize(frame, (FRAME_W, FRAME_H))
 
-        # Decode actual transmitted bytes for visual quality comparison.
-        compressed_frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-        if compressed_frame is None:
-            compressed_frame = np.zeros_like(frame)
+            # 1) Compress frame with ffmpeg
+            data = ffmpeg_compress(frame, current_crf, ffmpeg_path)
 
-        # Receive AI metric (4-byte network-order float).
-        try:
-            conf_payload = recv_exact(client_socket, 4)
-            conf_score = struct.unpack("!f", conf_payload)[0]
-            conf_score = max(0.0, min(1.0, conf_score))
+            # 2) Send length + payload
+            payload = struct.pack("Q", len(data)) + data
+            client_socket.sendall(payload)
 
-            # High confidence -> high CRF (lower quality)
-            # Low confidence -> low CRF (higher quality)
-            if FIXED_CRF is None:
-                current_crf = int(conf_score * 50)
+            # 3) Receive confidence metric from server
+            response = client_socket.recv(1024).decode(errors='ignore').strip()
+
+            conf_score = None
+            try:
+                conf_score = float(response)
+                # Inverse mapping:
+                # high confidence -> allow higher CRF (more compression)
+                # low confidence  -> lower CRF (better quality)
+                current_crf = int((1.0 - conf_score) * 50)
                 current_crf = max(5, min(50, current_crf))
-        except (ConnectionError, struct.error):
-            conf_score = 0.0
+            except ValueError:
+                print(f"[WARN] Non-float response from server: {response!r}")
 
-        # Single-window dashboard UI
-        cv2.putText(frame, "Source", (20, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-        cv2.putText(compressed_frame, "Decoded Compressed Stream", (20, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+            # Log every N frames
+            frame_count += 1
+            if frame_count % 10 == 0:
+                dt = time.time() - t0
+                fps = frame_count / dt if dt > 0 else 0.0
+                size_kb = len(data) / 1024.0
+                print(
+                    f"[STAT] frame={frame_count:5d}  fps={fps:5.2f}  "
+                    f"payload={size_kb:7.1f} KB  crf={current_crf:2d}  conf={conf_score}"
+                )
 
-        dashboard = cv2.hconcat([frame, compressed_frame])
-        cv2.putText(dashboard, f"ROI: {roi_ratio*100:.1f}%", (20, 470),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        cv2.putText(dashboard, f"FFmpeg CRF Knob: {active_crf}", (260, 470),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
-        cv2.putText(dashboard, f"Server Min Conf: {conf_score:.2f}", (620, 470),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
-        cv2.putText(
-            dashboard,
-            f"Mode: {'Fixed' if FIXED_CRF is not None else 'Adaptive'}",
-            (860, 470),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (200, 255, 0),
-            2
-        )
+            # Headless mode: no cv2.imshow / waitKey
+            if not HEADLESS:
+                cv2.putText(frame, f"FFmpeg CRF Knob: {current_crf}", (20, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 0), 2)
+                cv2.imshow("Edge Node: Adaptive Frame Processing", frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
 
-        cv2.imshow("Edge Node Dashboard", dashboard)
+    except KeyboardInterrupt:
+        print("\n[STOP] KeyboardInterrupt received. Exiting...")
+    finally:
+        try:
+            if cap:
+                cap.release()
+        except Exception:
+            pass
+        try:
+            if client_socket:
+                client_socket.close()
+        except Exception:
+            pass
+        if not HEADLESS:
+            cv2.destroyAllWindows()
+        print("[CLEANUP] Camera node stopped.")
 
-        elapsed = time.time() - interval_start_ts
-        if elapsed >= LOG_BANDWIDTH_EVERY_SEC:
-            saved_bytes = interval_baseline_bytes - interval_sent_bytes
-            saved_pct = (
-                (saved_bytes / interval_baseline_bytes) * 100.0
-                if interval_baseline_bytes > 0 else 0.0
-            )
-            sent_mbps = (interval_sent_bytes * 8.0) / elapsed / 1_000_000
-            baseline_mbps = (interval_baseline_bytes * 8.0) / elapsed / 1_000_000
-            print(
-                "[BW] "
-                f"{elapsed:.1f}s | sent={interval_sent_bytes/1024/1024:.2f} MB "
-                f"| baseline={interval_baseline_bytes/1024/1024:.2f} MB "
-                f"| saved={saved_bytes/1024/1024:.2f} MB ({saved_pct:.2f}%) "
-                f"| sent_rate={sent_mbps:.2f} Mbps "
-                f"| baseline_rate={baseline_mbps:.2f} Mbps"
-            )
-            interval_start_ts = time.time()
-            interval_sent_bytes = 0
-            interval_baseline_bytes = 0
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-finally:
-    cap.release()
-    client_socket.close()
-    cv2.destroyAllWindows()
+if __name__ == "__main__":
+    main()
