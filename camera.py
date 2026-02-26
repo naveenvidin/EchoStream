@@ -7,7 +7,7 @@ import time
 import shutil
 
 # === CONFIGURATION ===
-SERVER_IP = '192.168.7.203'
+SERVER_IP = "100.88.178.33"
 PORT = 9999
 
 # CRF-like knob (0~51 in ffmpeg CRF world; here we map roughly to JPEG bitrate quality behavior)
@@ -61,12 +61,12 @@ def ffmpeg_compress(frame, crf_val, ffmpeg_path):
         '-vcodec', 'rawvideo',
         '-s', f'{width}x{height}',
         '-pix_fmt', 'bgr24',
-        '-i', '-',          # stdin
+        '-i', '-',  # stdin
         '-vframes', '1',
         '-b:v', str(max(1, int(crf_val / 2))),  # simple mapping
         '-f', 'mjpeg',
         '-loglevel', 'quiet',
-        '-'                 # stdout
+        '-'        # stdout
     ]
 
     process = subprocess.Popen(
@@ -107,6 +107,7 @@ def main():
 
     try:
         client_socket = connect_with_retry(SERVER_IP, PORT, retries=60, delay_sec=1.0)
+        client_socket.settimeout(5.0)
         print("[RUN] Camera Node: FFmpeg Subprocess Controller Active (Headless).")
 
         while True:
@@ -176,5 +177,17 @@ def main():
         print("[CLEANUP] Camera node stopped.")
 
 
+def run_forever():
+    while True:
+        try:
+            main()
+        except (BrokenPipeError, ConnectionResetError, ConnectionRefusedError, TimeoutError, OSError) as e:
+            print(f"[RECONNECT] network/socket error: {e}. retrying in 3s...")
+            time.sleep(3)
+        except Exception as e:
+
+            print(f"[RECONNECT] unexpected error: {e}. retrying in 3s...")
+            time.sleep(3)
+
 if __name__ == "__main__":
-    main()
+    run_forever()

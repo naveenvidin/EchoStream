@@ -1,3 +1,9 @@
+<<<<<<< HEAD
 /venv
 ffmpg_venv
 optical_flow_venv
+=======
+.venv/
+.vscode/
+*.pt
+>>>>>>> 690a790 (add virtual IP to camera side and improve connectivity)
