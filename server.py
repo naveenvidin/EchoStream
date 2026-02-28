@@ -4,6 +4,7 @@ from ultralytics import YOLO
 
 device = 'mps' if torch.backends.mps.is_available() else 'cpu'
 model = YOLO('yolov8n.pt').to(device)
+SHOW_SERVER_WINDOW = False
 
 server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -38,11 +39,13 @@ try:
             confidences = [box.conf[0].item() for r in results for box in r.boxes]
             
             # Send Metric: Min confidence score (Inference Engine logic)
-            min_conf = min(confidences) if confidences else 1.0
+            min_conf = min(confidences) if confidences else 0.0
             conn.sendall(str(round(min_conf, 2)).encode())
 
-            cv2.imshow("Edge Server: YOLO Inference", results[0].plot())
+            if SHOW_SERVER_WINDOW:
+                cv2.imshow("Edge Server: YOLO Inference", results[0].plot())
             
-        if cv2.waitKey(1) & 0xFF == ord('q'): break
+        if SHOW_SERVER_WINDOW and cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 finally:
     conn.close(); server_socket.close(); cv2.destroyAllWindows()
