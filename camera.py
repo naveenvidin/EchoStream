@@ -6,9 +6,59 @@ import numpy as np
 import time
 import shutil
 
+class OpticalFlowMasker:
+    def __init__(self, motion_threshold=3.0, min_contour_area=1200, morph_kernel_size=7):
+        self.motion_threshold = motion_threshold
+        self.min_contour_area = min_contour_area
+        self.kernel = np.ones((morph_kernel_size, morph_kernel_size), np.uint8)
+        self.prev_gray = None
+
+    def apply(self, frame_bgr):
+        """
+        Returns:
+            masked_frame: motion-ROI-only BGR frame
+            roi_ratio: fraction of image area covered by selected ROIs
+        """
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+
+        if self.prev_gray is None:
+            self.prev_gray = gray
+            return frame_bgr.copy(), 1.0
+
+        flow = cv2.calcOpticalFlowFarneback(
+            self.prev_gray, gray, None,
+            0.5, 2, 15, 2, 5, 1.1, 0
+        )
+
+        magnitude, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+        motion_mask = (magnitude > self.motion_threshold).astype(np.uint8) * 255
+        motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_CLOSE, self.kernel)
+
+        contours, _ = cv2.findContours(
+            motion_mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        masked = np.zeros_like(frame_bgr)
+        frame_area = frame_bgr.shape[0] * frame_bgr.shape[1]
+        roi_area = 0
+
+        for cnt in contours:
+            if cv2.contourArea(cnt) > self.min_contour_area:
+                x, y, w, h = cv2.boundingRect(cnt)
+                masked[y:y + h, x:x + w] = frame_bgr[y:y + h, x:x + w]
+                roi_area += w * h
+
+        self.prev_gray = gray
+        roi_ratio = (roi_area / frame_area) if frame_area > 0 else 0.0
+        return masked, roi_ratio
+
 # === CONFIGURATION ===
 SERVER_IP = "100.88.178.33"
 PORT = 9999
+USE_MASKING = True
+BG_ALPHA = 0.15
 
 # CRF-like knob (0~51 in ffmpeg CRF world; here we map roughly to JPEG bitrate quality behavior)
 current_crf = 45
@@ -33,6 +83,9 @@ def find_ffmpeg():
 def connect_with_retry(server_ip, port, retries=30, delay_sec=1.0):
     """Retry TCP connect so camera node can start before/after server."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    
     last_err = None
     for i in range(1, retries + 1):
         try:
@@ -63,7 +116,8 @@ def ffmpeg_compress(frame, crf_val, ffmpeg_path):
         '-pix_fmt', 'bgr24',
         '-i', '-',  # stdin
         '-vframes', '1',
-        '-b:v', str(max(1, int(crf_val / 2))),  # simple mapping
+        # '-b:v', str(max(1, int(crf_val / 2))),  # simple mapping
+        '-q:v', str(max(2, min(31, int(crf_val / 2)))),
         '-f', 'mjpeg',
         '-loglevel', 'quiet',
         '-'        # stdout
@@ -109,6 +163,14 @@ def main():
         client_socket = connect_with_retry(SERVER_IP, PORT, retries=60, delay_sec=1.0)
         client_socket.settimeout(5.0)
         print("[RUN] Camera Node: FFmpeg Subprocess Controller Active (Headless).")
+        
+        masker = OpticalFlowMasker(
+            motion_threshold=3.0,
+            min_contour_area=1200,
+            morph_kernel_size=7
+    )
+
+        conf_score = None
 
         while True:
             ret, frame = cap.read()
@@ -119,26 +181,48 @@ def main():
 
             frame = cv2.resize(frame, (FRAME_W, FRAME_H))
 
+            # 0) ROI masking (optional)
+            if USE_MASKING:
+                masked, roi_ratio = masker.apply(frame)
+                if BG_ALPHA > 0:
+                    frame_to_send = (masked.astype(np.float32) + BG_ALPHA * frame.astype(np.float32)).clip(0, 255).astype(np.uint8)
+                else:
+                    frame_to_send = masked
+            else:
+                roi_ratio = 1.0
+                frame_to_send = frame
+
+            if USE_MASKING and roi_ratio < 0.01:
+                frame_to_send = frame
+                roi_ratio = 1.0
+
             # 1) Compress frame with ffmpeg
-            data = ffmpeg_compress(frame, current_crf, ffmpeg_path)
+            data = ffmpeg_compress(frame_to_send, current_crf, ffmpeg_path)
 
             # 2) Send length + payload
-            payload = struct.pack("Q", len(data)) + data
-            client_socket.sendall(payload)
+            client_socket.sendall(struct.pack("Q", len(data)) + data)
 
-            # 3) Receive confidence metric from server
-            response = client_socket.recv(1024).decode(errors='ignore').strip()
-
-            conf_score = None
+            # 3) Receive AI metric (confidence) from server
             try:
-                conf_score = float(response)
-                # Inverse mapping:
-                # high confidence -> allow higher CRF (more compression)
-                # low confidence  -> lower CRF (better quality)
-                current_crf = int((1.0 - conf_score) * 50)
-                current_crf = max(5, min(50, current_crf))
-            except ValueError:
-                print(f"[WARN] Non-float response from server: {response!r}")
+                resp = client_socket.recv(1024).decode(errors="ignore").strip()
+                conf_score = float(resp)
+            except Exception:
+                conf_score = None
+
+            # 4) Update CRF using conf + roi_ratio (smooth)
+            # base from conf: low conf -> better quality (lower CRF)
+            if conf_score is not None:
+                base = int((1.0 - conf_score) * 50)
+            else:
+                base = current_crf  # keep if no signal
+
+            # ROI bonus: ROI smaller -> allow more compression (higher CRF)
+            roi_bonus = int((1.0 - max(0.0, min(1.0, roi_ratio))) * 10)
+            target = base + roi_bonus
+
+            # smooth to avoid oscillation
+            current_crf = int(0.8 * current_crf + 0.2 * target)
+            current_crf = max(5, min(50, current_crf))
 
             # Log every N frames
             frame_count += 1
@@ -147,14 +231,14 @@ def main():
                 fps = frame_count / dt if dt > 0 else 0.0
                 size_kb = len(data) / 1024.0
                 print(
-                    f"[STAT] frame={frame_count:5d}  fps={fps:5.2f}  "
-                    f"payload={size_kb:7.1f} KB  crf={current_crf:2d}  conf={conf_score}"
+                    f"[STAT] frame={frame_count:5d} fps={fps:5.2f} "
+                    f"payload={size_kb:7.1f} KB crf={current_crf:2d} "
+                    f"conf={conf_score} roi={roi_ratio:.3f}"
                 )
 
-            # Headless mode: no cv2.imshow / waitKey
             if not HEADLESS:
-                cv2.putText(frame, f"FFmpeg CRF Knob: {current_crf}", (20, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 0), 2)
+                cv2.putText(frame, f"CRF: {current_crf} roi:{roi_ratio:.2f} conf:{conf_score}", (20, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
                 cv2.imshow("Edge Node: Adaptive Frame Processing", frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
