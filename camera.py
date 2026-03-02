@@ -212,7 +212,8 @@ def main():
             # 4) Update CRF using conf + roi_ratio (smooth)
             # base from conf: low conf -> better quality (lower CRF)
             if conf_score is not None:
-                base = int((1.0 - conf_score) * 50)
+                # base = int((1.0 - conf_score) * 50)
+                base = int(conf_score * 50)
             else:
                 base = current_crf  # keep if no signal
 
