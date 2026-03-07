@@ -39,8 +39,8 @@ try:
             confidences = [box.conf[0].item() for r in results for box in r.boxes]
             
             # Send Metric: Min confidence score (Inference Engine logic)
-            min_conf = min(confidences) if confidences else 0.0
-            conn.sendall(str(round(min_conf, 2)).encode())
+            min_conf = min(confidences) if confidences else 0.5
+            conn.sendall(struct.pack("!f", float(min_conf)))
 
             if SHOW_SERVER_WINDOW:
                 cv2.imshow("Edge Server: YOLO Inference", results[0].plot())
