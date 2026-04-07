@@ -1,7 +1,8 @@
 import cv2
 import socket
 import struct
-import ffmpeg
+import subprocess
+import select
 import time
 import numpy as np
 from motion_masker import OpticalFlowMasker
@@ -9,9 +10,12 @@ from motion_masker import OpticalFlowMasker
 # === CONFIGURATION ===
 SERVER_IP = 'localhost'
 PORT = 9999
-current_crf = 45  # 0 (best) → 51 (worst)
+current_crf = 45        # 0 (best) → 51 (worst)
+last_crf = current_crf  # tracks last CRF used to detect when restart is needed
 LOG_BANDWIDTH_EVERY_SEC = 60
-FIXED_CRF = None  # Set None to enable adaptive CRF.
+FIXED_CRF = None        # Set None to enable adaptive CRF
+FRAME_W = 640
+FRAME_H = 480
 
 cap = cv2.VideoCapture(0)
 
@@ -35,43 +39,53 @@ def recv_exact(sock, size):
     return b"".join(chunks)
 
 
-def ffmpeg_compress(frame, crf_val):
+def start_encoder(crf):
     """
-    Compress a single frame using ffmpeg-python.
+    Spawns a persistent ffmpeg process that:
+    - reads raw BGR frames from stdin
+    - encodes them as H.264 with the given CRF
+    - outputs a raw H.264 bytestream to stdout
     """
-
-    height, width, _ = frame.shape
-    raw_bytes = frame.tobytes()
-
-    # Map CRF-like value to MJPEG quantizer (2=best, 31=worst).
-    mjpeg_q = int(np.interp(float(crf_val), [0.0, 51.0], [2.0, 31.0]))
-    mjpeg_q = max(2, min(31, mjpeg_q))
-
-    process = (
-        ffmpeg
-        .input(
-            'pipe:',
-            format='rawvideo',
-            pix_fmt='bgr24',
-            s=f'{width}x{height}'
-        )
-        .output(
-            'pipe:',
-            vframes=1,
-            format='mjpeg',
-            **{'q:v': str(mjpeg_q)}
-        )
-        .global_args('-loglevel', 'quiet')
-        .run_async(pipe_stdin=True, pipe_stdout=True)
+    return subprocess.Popen(
+        [
+            'ffmpeg', '-y',
+            '-f', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-s', f'{FRAME_W}x{FRAME_H}',
+            '-r', '30',
+            '-i', 'pipe:0',
+            '-c:v', 'libx264',
+            '-crf', str(crf),
+            '-preset', 'ultrafast',
+            '-tune', 'zerolatency',
+            '-f', 'h264',
+            'pipe:1'
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL
     )
 
-    out, _ = process.communicate(input=raw_bytes)
-    return out
+
+def compress_frame(encoder, frame):
+    """
+    Writes one raw BGR frame into the encoder stdin.
+    Returns whatever H.264 bytes are ready immediately — may be empty.
+    """
+    encoder.stdin.write(frame.tobytes())
+    encoder.stdin.flush()
+
+    readable, _, _ = select.select([encoder.stdout], [], [], 0)
+    if readable:
+        return encoder.stdout.read1()
+    return b""
 
 
 def estimate_full_frame_bytes(frame, crf_val):
     """
-    Estimate full-frame JPEG size (for baseline comparison).
+    Estimate full-frame JPEG size as a baseline BWC comparison.
+    Note: this is JPEG-based so not apples-to-apples with H.264,
+    but kept for relative trending across frames.
     """
     jpeg_quality = max(5, min(95, 100 - int(crf_val) * 2))
     ok, encoded = cv2.imencode(
@@ -82,11 +96,12 @@ def estimate_full_frame_bytes(frame, crf_val):
     return len(encoded) if ok else 0
 
 
-print("Camera Node: FFmpeg-Python Adaptive Controller Active.")
+encoder = start_encoder(current_crf)
+
+print("Camera Node: H.264 Adaptive Controller Active.")
 
 try:
     conf_score = 0.0
-    header_bytes = struct.calcsize("Q")
     interval_start_ts = time.time()
     interval_sent_bytes = 0
     interval_baseline_bytes = 0
@@ -96,35 +111,42 @@ try:
         if not ret:
             break
 
-        frame = cv2.resize(frame, (640, 480))
+        frame = cv2.resize(frame, (FRAME_W, FRAME_H))
         masked_frame, roi_ratio = masker.apply(frame)
         active_crf = FIXED_CRF if FIXED_CRF is not None else current_crf
 
-        # Compress masked frame and send it to server
-        data = ffmpeg_compress(masked_frame, active_crf)
-        sent_bytes = len(data) + header_bytes
+        # Restart encoder only if CRF has changed since last frame
+        if active_crf != last_crf:
+            encoder.stdin.close()
+            encoder.wait()
+            encoder = start_encoder(active_crf)
+            last_crf = active_crf
 
-        # Baseline: what we'd approximately send if we streamed full frame
-        full_est_bytes = estimate_full_frame_bytes(frame, active_crf) + header_bytes
+        # Compress masked frame and send to server
+        data = compress_frame(encoder, masked_frame)
+        sent_bytes = len(data)
         interval_sent_bytes += sent_bytes
+
+        # Baseline: approximate what full-frame MJPEG would have cost
+        full_est_bytes = estimate_full_frame_bytes(frame, active_crf)
         interval_baseline_bytes += full_est_bytes
 
-        # Send compressed frame
-        client_socket.sendall(struct.pack("Q", len(data)) + data)
+        # Send raw H.264 bytes — no size header framing
+        if data:
+            client_socket.sendall(data)
 
-        # Decode actual transmitted bytes for visual quality comparison.
-        compressed_frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-        if compressed_frame is None:
-            compressed_frame = np.zeros_like(frame)
+        # Dashboard: show masked frame in place of decoded stream
+        # cv2.imdecode cannot decode raw H.264 chunks
+        compressed_frame = masked_frame
 
-        # Receive AI metric (4-byte network-order float).
+        # Receive AI metric (4-byte network-order float)
         try:
             conf_payload = recv_exact(client_socket, 4)
             conf_score = struct.unpack("!f", conf_payload)[0]
             conf_score = max(0.0, min(1.0, conf_score))
 
-            # High confidence -> high CRF (lower quality)
-            # Low confidence -> low CRF (higher quality)
+            # High confidence -> high CRF (lower quality, less bandwidth)
+            # Low confidence -> low CRF (higher quality, more bandwidth)
             if FIXED_CRF is None:
                 current_crf = int(conf_score * 50)
                 current_crf = max(5, min(50, current_crf))
@@ -134,13 +156,13 @@ try:
         # Single-window dashboard UI
         cv2.putText(frame, "Source", (20, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-        cv2.putText(compressed_frame, "Decoded Compressed Stream", (20, 30),
+        cv2.putText(compressed_frame, "Masked Frame (uncompressed)", (20, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
 
         dashboard = cv2.hconcat([frame, compressed_frame])
         cv2.putText(dashboard, f"ROI: {roi_ratio*100:.1f}%", (20, 470),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        cv2.putText(dashboard, f"FFmpeg CRF Knob: {active_crf}", (260, 470),
+        cv2.putText(dashboard, f"CRF: {active_crf}", (260, 470),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
         cv2.putText(dashboard, f"Server Min Conf: {conf_score:.2f}", (620, 470),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
@@ -181,6 +203,8 @@ try:
             break
 
 finally:
+    encoder.stdin.close()
+    encoder.wait()
     cap.release()
     client_socket.close()
     cv2.destroyAllWindows()
