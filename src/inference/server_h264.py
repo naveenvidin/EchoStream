@@ -117,12 +117,23 @@ def compute_metric(confidences: list) -> float:
     return float(min(confidences))
 
 
-def encode_response(metric: float) -> bytes:
+def encode_response(metric: float, heatmap: np.ndarray, boxes: list) -> bytes:
     """
-    Pack the response sent back to camera.py.
-    Format: 4-byte big-endian float (conf metric).
+    Pack the response sent back to camera-h264.py.
+    Format:
+      - float32 metric
+      - uint32 width
+      - uint32 height
+      - uint32 num_boxes
+      - heatmap bytes (uint8, H*W)
+      - boxes (num_boxes * 5 float32): x1,y1,x2,y2,conf
     """
-    return struct.pack('!f', metric)
+    h, w = heatmap.shape[:2]
+    payload = struct.pack('!fIII', float(metric), int(w), int(h), int(len(boxes)))
+    payload += heatmap.tobytes()
+    for b in boxes:
+        payload += struct.pack('!fffff', *b)
+    return payload
 
 
 # ─────────────────────────────────────────────
@@ -171,8 +182,9 @@ def main():
             frame = decoder.decode(nal_bytes)
 
             if frame is None:
-                # Still buffering initial GOP — send neutral metric
-                conn.sendall(encode_response(0.5))
+                # Still buffering initial GOP — send neutral metric + empty heatmap
+                empty_heat = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
+                conn.sendall(encode_response(0.5, empty_heat, []))
                 continue
 
             # ── YOLO inference ───────────────────────────────────────────────
@@ -184,8 +196,29 @@ def main():
             ]
             metric = compute_metric(confidences)
 
-            # ── Send metric back to camera ────────────────────────────────────
-            conn.sendall(encode_response(metric))
+            # Build person heatmap (binary) and boxes list
+            h, w = frame.shape[:2]
+            heatmap = np.zeros((h, w), dtype=np.uint8)
+            person_boxes = []
+            if results and results[0].boxes is not None and len(results[0].boxes) > 0:
+                boxes = results[0].boxes
+                for i in range(len(boxes)):
+                    cls_id = int(boxes.cls[i].item())
+                    cls_name = results[0].names.get(cls_id, str(cls_id))
+                    if cls_name != "person":
+                        continue
+                    conf = float(boxes.conf[i].item())
+                    x1, y1, x2, y2 = boxes.xyxy[i].tolist()
+                    x1 = max(0, min(w - 1, int(x1)))
+                    y1 = max(0, min(h - 1, int(y1)))
+                    x2 = max(0, min(w, int(x2)))
+                    y2 = max(0, min(h, int(y2)))
+                    if x2 > x1 and y2 > y1:
+                        heatmap[y1:y2, x1:x2] = 255
+                        person_boxes.append((float(x1), float(y1), float(x2), float(y2), conf))
+
+            # ── Send metric + heatmap + boxes back ───────────────────────────
+            conn.sendall(encode_response(metric, heatmap, person_boxes))
 
             # ── Optional server-side display ─────────────────────────────────
             if SHOW_SERVER_WINDOW:
