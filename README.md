@@ -6,10 +6,10 @@ source venv/bin/activate
 pip install -r requirements.txt
 
 # FIRST
-run server-h264.py, and wait for the confirmation message that the server is active
+run ``python -m src.inference.server_h264``, and wait for the confirmation message that the server is active
 
 # SECOND
-run camera-h264.py on a separate terminal, and the video preview should automatically open
+run ``python -m src.streaming.camera_h264`` on a separate terminal, and the video preview should automatically open
 to close, press 'q' to end the camera script.
 
 the program in its current state is looking for moving objects and adjusting quality based

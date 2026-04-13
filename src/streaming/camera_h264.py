@@ -6,7 +6,7 @@ import threading
 import queue
 import time
 import numpy as np
-from motion_masker import OpticalFlowMasker
+from src.optical_flow.motion_masker import OpticalFlowMasker
 
 # === CONFIGURATION ===
 SERVER_IP = 'localhost'
@@ -16,6 +16,7 @@ FIXED_CRF = None          # Set an int (e.g. 28) to lock quality; None = adaptiv
 GOP_SIZE = 30             # Keyframe every N frames (1 sec at 30 fps)
 LOG_BANDWIDTH_EVERY_SEC = 60
 WIDTH, HEIGHT = 640, 480
+SHOW_IMPORTANCE_WINDOW = False
 
 
 # ─────────────────────────────────────────────
@@ -320,6 +321,8 @@ def main():
     header_size = struct.calcsize('Q')
     conf_score = 0.5
     prev_conf = 0.5
+    prev_object_score_map = None
+    last_person_boxes = []
     interval_start = time.time()
     interval_sent = 0
     interval_baseline = 0
@@ -337,7 +340,7 @@ def main():
                 break
 
             frame = cv2.resize(frame, (WIDTH, HEIGHT))
-            masked_frame, roi_ratio = masker.apply(frame)
+            masked_frame, roi_ratio = masker.apply(frame, object_score_map=prev_object_score_map)
 
             # ── Encode ──────────────────────────────────────────────────────
             data = encoder.encode(masked_frame)
@@ -355,11 +358,29 @@ def main():
                 interval_baseline += estimate_baseline_bytes(frame, active_crf) + header_size
                 client_socket.sendall(struct.pack('Q', len(data)) + data)
 
-                # ── Receive conf_score ───────────────────────────────────────
+                # ── Receive metric + heatmap + boxes ─────────────────────────
                 try:
-                    payload = recv_exact(client_socket, 4)
-                    conf_score = struct.unpack('!f', payload)[0]
+                    header = recv_exact(client_socket, 16)
+                    conf_score, heat_w, heat_h, num_boxes = struct.unpack('!fIII', header)
                     conf_score = max(0.0, min(1.0, conf_score))
+
+                    heat_bytes = recv_exact(client_socket, int(heat_w * heat_h))
+                    heatmap = np.frombuffer(heat_bytes, dtype=np.uint8).reshape(
+                        (int(heat_h), int(heat_w))
+                    )
+                    object_score_map = heatmap.astype(np.float32) / 255.0
+
+                    boxes = []
+                    if num_boxes:
+                        box_bytes = recv_exact(client_socket, int(num_boxes * 20))
+                        for i in range(int(num_boxes)):
+                            offset = i * 20
+                            x1, y1, x2, y2, conf = struct.unpack(
+                                '!fffff',
+                                box_bytes[offset:offset + 20]
+                            )
+                            boxes.append((x1, y1, x2, y2, conf))
+                    last_person_boxes = boxes
 
                     new_crf = conf_to_crf(conf_score)
                     big_change = abs(conf_score - prev_conf) > 0.15
@@ -367,6 +388,9 @@ def main():
                     prev_conf = conf_score
                 except (ConnectionError, struct.error):
                     conf_score = 0.5
+                    object_score_map = None
+                    last_person_boxes = []
+                prev_object_score_map = object_score_map
 
             # ── Pull latest locally decoded frame ────────────────────────────
             decoded = local_decoder.get_frame()
@@ -383,6 +407,22 @@ def main():
                 right = last_decoded.copy()
                 draw_hud(right, "Encoded stream — what server receives",
                          active_crf, conf_score, roi_ratio, sent_kb, mode)
+                for (x1, y1, x2, y2, conf) in last_person_boxes:
+                    x1i = int(max(0, min(right.shape[1] - 1, x1)))
+                    y1i = int(max(0, min(right.shape[0] - 1, y1)))
+                    x2i = int(max(0, min(right.shape[1] - 1, x2)))
+                    y2i = int(max(0, min(right.shape[0] - 1, y2)))
+                    cv2.rectangle(right, (x1i, y1i), (x2i, y2i), (0, 255, 255), 2)
+                    cv2.putText(
+                        right,
+                        f"person {conf:.2f}",
+                        (x1i, max(0, y1i - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (0, 255, 255),
+                        1,
+                        cv2.LINE_AA
+                    )
             else:
                 right = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
                 cv2.putText(right, "Buffering first GOP...", (110, HEIGHT // 2 - 10),
@@ -392,6 +432,10 @@ def main():
 
             dashboard = cv2.hconcat([left, right])
             cv2.imshow('EchoStream — Edge Node', dashboard)
+            if SHOW_IMPORTANCE_WINDOW and masker.last_importance is not None:
+                importance_u8 = (masker.last_importance * 255.0).astype(np.uint8)
+                importance_heat = cv2.applyColorMap(importance_u8, cv2.COLORMAP_JET)
+                cv2.imshow('Importance Heatmap', importance_heat)
 
             # ── Bandwidth log ────────────────────────────────────────────────
             elapsed = time.time() - interval_start
