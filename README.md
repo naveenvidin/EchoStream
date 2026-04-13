@@ -10,7 +10,7 @@ run server-h264.py, and wait for the confirmation message that the server is act
 
 # SECOND
 run camera-h264.py on a separate terminal, and the video preview should automatically open
-to close, kill the terminal running the camera script
+to close, press 'q' to end the camera script.
 
 the program in its current state is looking for moving objects and adjusting quality based
 on its confidence when identifying that object. if there is no movement, the entire screen
