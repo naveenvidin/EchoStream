@@ -10,7 +10,7 @@ run ``python -m src.inference.server_h264``, and wait for the confirmation messa
 
 # SECOND
 run ``python -m src.streaming.camera_h264`` on a separate terminal, and the video preview should automatically open
-to close, kill the terminal running the camera script
+to close, press 'q' to end the camera script.
 
 the program in its current state is looking for moving objects and adjusting quality based
 on its confidence when identifying that object. if there is no movement, the entire screen
