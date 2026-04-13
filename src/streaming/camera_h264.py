@@ -16,6 +16,7 @@ FIXED_CRF = None          # Set an int (e.g. 28) to lock quality; None = adaptiv
 GOP_SIZE = 30             # Keyframe every N frames (1 sec at 30 fps)
 LOG_BANDWIDTH_EVERY_SEC = 60
 WIDTH, HEIGHT = 640, 480
+SHOW_IMPORTANCE_WINDOW = False
 
 
 # ─────────────────────────────────────────────
@@ -431,6 +432,10 @@ def main():
 
             dashboard = cv2.hconcat([left, right])
             cv2.imshow('EchoStream — Edge Node', dashboard)
+            if SHOW_IMPORTANCE_WINDOW and masker.last_importance is not None:
+                importance_u8 = (masker.last_importance * 255.0).astype(np.uint8)
+                importance_heat = cv2.applyColorMap(importance_u8, cv2.COLORMAP_JET)
+                cv2.imshow('Importance Heatmap', importance_heat)
 
             # ── Bandwidth log ────────────────────────────────────────────────
             elapsed = time.time() - interval_start
