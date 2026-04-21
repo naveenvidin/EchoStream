@@ -261,6 +261,7 @@ def main():
             segment_frames.append(masked_frame)
 
             if len(segment_frames) >= FRAMES_PER_SEGMENT:
+                # print(f"[Segment] Frames: {len(segment_frames)} | CRF: {active_crf} | Baseline: {segment_baseline/1024:.1f} KB")
                 try:
                     encode_queue.put_nowait((segment_frames, active_crf, segment_baseline))
                 except queue.Full:

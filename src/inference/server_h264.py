@@ -242,10 +242,7 @@ def main():
 
                 # --- PACING LOGIC ---
                 # Ensure we don't process faster than real-time (30 FPS)
-                elapsed = time.time() - loop_start
-                sleep_time = FRAME_DURATION - elapsed
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
+                time.sleep(FRAME_DURATION)  # Base pacing to target FPS
 
         inf_thread = threading.Thread(target=inference_loop, daemon=True)
         inf_thread.start()
