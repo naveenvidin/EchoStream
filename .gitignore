@@ -1,3 +1,17 @@
 /venv
 ffmpg_venv
 optical_flow_venv
+
+# Local notes — not for upstream
+*.txt
+!requirements.txt
+
+# Video artifacts — large binaries, keep out of git
+*.mp4
+
+# Model weights — auto-downloaded by ultralytics on first use
+*.pt
+
+# Run outputs — keep the folder but not its contents
+/runs/*
+!/runs/.gitkeep
