@@ -3,7 +3,7 @@ import struct
 import subprocess
 import threading
 import queue
-import json
+import time
 import cv2
 import torch
 import numpy as np
@@ -12,26 +12,21 @@ from ultralytics import YOLO
 # === CONFIGURATION ===
 PORT = 9999
 WIDTH, HEIGHT = 640, 480
-SHOW_SERVER_WINDOW = False
+SHOW_SERVER_WINDOW = True
+FPS = 30
+FRAME_DURATION = 1.0 / FPS
 
 
 # ─────────────────────────────────────────────
 #  H.264 Decoder — persistent ffmpeg subprocess
 # ─────────────────────────────────────────────
 class H264Decoder:
-    """
-    Wraps a single long-lived ffmpeg process that accepts raw H.264 NAL
-    bytes on stdin and outputs BGR24 frames on stdout.
-
-    Uses a background reader thread so stdout never fills its OS pipe
-    buffer while we're waiting to write more input.
-    """
-
-    def __init__(self, width=640, height=480):
+    def __init__(self, width: int = 640, height: int = 480):
         self.width = width
         self.height = height
         self._frame_bytes = width * height * 3
-        self._frame_q = queue.Queue(maxsize=8)
+        # Buffer 2 seconds worth of frames to handle network bursts
+        self._frame_q = queue.Queue(maxsize=FPS * 2) 
         self._proc = None
         self._reader_thread = None
         self._start()
@@ -63,6 +58,8 @@ class H264Decoder:
             frame = np.frombuffer(raw, dtype=np.uint8).reshape(
                 (self.height, self.width, 3)
             ).copy()
+            
+            # If queue is full, drop oldest to keep feed "live"
             if self._frame_q.full():
                 try:
                     self._frame_q.get_nowait()
@@ -73,15 +70,16 @@ class H264Decoder:
             except queue.Full:
                 pass
 
-    def decode(self, nal_bytes: bytes):
-        """Push NAL bytes in; return oldest decoded frame or None."""
+    def push(self, nal_bytes: bytes):
         try:
             self._proc.stdin.write(nal_bytes)
             self._proc.stdin.flush()
-        except BrokenPipeError:
-            return None
+        except (BrokenPipeError, OSError):
+            pass
+
+    def get_frame(self):
         try:
-            return self._frame_q.get(timeout=0.05)
+            return self._frame_q.get_nowait()
         except queue.Empty:
             return None
 
@@ -94,151 +92,190 @@ class H264Decoder:
 
 
 # ─────────────────────────────────────────────
-#  Helpers
+#  Networking Helpers
 # ─────────────────────────────────────────────
-def recv_exact(sock, size: int) -> bytes:
-    chunks, received = [], 0
-    while received < size:
-        chunk = sock.recv(size - received)
+def _recv_exact(conn, size):
+    """Helper to ensure we don't get partial reads from the socket."""
+    chunks = []
+    bytes_recvd = 0
+    while bytes_recvd < size:
+        chunk = conn.recv(min(size - bytes_recvd, 4096))
         if not chunk:
-            raise ConnectionError("Camera disconnected.")
+            return None
         chunks.append(chunk)
-        received += len(chunk)
+        bytes_recvd += len(chunk)
     return b''.join(chunks)
 
+def receive_loop(conn, decoder):
+    """Expects [4-byte length prefix] + [H.264 data segment]"""
+    while True:
+        try:
+            header = _recv_exact(conn, 4)
+            if not header:
+                break
+            payload_size = struct.unpack('!I', header)[0]
 
-def compute_metric(confidences: list) -> float:
-    """
-    Min confidence → high value = confident scene → camera compresses harder.
-    Returns 0.5 (neutral) when no detections are present.
-    """
+            segment_data = _recv_exact(conn, payload_size)
+            if not segment_data:
+                break
+
+            decoder.push(segment_data)
+        except (ConnectionError, OSError, struct.error) as e:
+            print(f"Receiver: Connection lost ({e})")
+            break
+
+# ─────────────────────────────────────────────
+#  Inference/HUD Helpers
+# ─────────────────────────────────────────────
+def compute_confidence(confidences: list) -> float:
     if not confidences:
         return 0.5
     return float(min(confidences))
 
+def draw_hud(frame: np.ndarray, label: str, conf: float,
+             person_boxes: list, fps: float) -> np.ndarray:
+    h, w = frame.shape[:2]
+    # Header/Footer overlays
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (w, 36), (0, 0, 0), -1)
+    cv2.rectangle(overlay, (0, h - 48), (w, h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
 
-def encode_response(metric: float, heatmap: np.ndarray, boxes: list) -> bytes:
-    """
-    Pack the response sent back to camera-h264.py.
-    Format:
-      - float32 metric
-      - uint32 width
-      - uint32 height
-      - uint32 num_boxes
-      - heatmap bytes (uint8, H*W)
-      - boxes (num_boxes * 5 float32): x1,y1,x2,y2,conf
-    """
-    h, w = heatmap.shape[:2]
-    payload = struct.pack('!fIII', float(metric), int(w), int(h), int(len(boxes)))
-    payload += heatmap.tobytes()
-    for b in boxes:
-        payload += struct.pack('!fffff', *b)
-    return payload
+    cv2.putText(frame, label, (10, 26),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+
+    stats = f"Conf {conf:.2f}  Processing FPS {fps:.1f}"
+    cv2.putText(frame, stats, (10, h - 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 255, 120), 1, cv2.LINE_AA)
+
+    for (x1, y1, x2, y2, c) in person_boxes:
+        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 255), 2)
+        cv2.putText(frame, f"person {c:.2f}", (int(x1), max(0, int(y1) - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+    return frame
 
 
 # ─────────────────────────────────────────────
-#  Main
+#  Main Execution
 # ─────────────────────────────────────────────
 def main():
     device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+    if torch.cuda.is_available(): device = 'cuda'
+    
     model = YOLO('yolov8n.pt').to(device)
+    decoder = H264Decoder(width=WIDTH, height=HEIGHT)
 
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind(('0.0.0.0', PORT))
     server_socket.listen(1)
-    print(f"Edge Server: H.264 AI Inference Engine active on port {PORT}")
+    print(f"Edge Server: Listening on port {PORT} (Device: {device})")
 
-    decoder = H264Decoder(width=WIDTH, height=HEIGHT)
-    header_size = struct.calcsize('Q')
+    shared_lock = threading.Lock()
+    shared_state = {
+        'display_frame': None,
+        'conf': 0.5,
+        'person_boxes': [],
+        'fps': 0.0,
+    }
 
     try:
         conn, addr = server_socket.accept()
         print(f"Edge Server: connection from {addr}")
-        buf = b''
 
-        while True:
-            # ── Read frame header ────────────────────────────────────────────
-            while len(buf) < header_size:
-                packet = conn.recv(8192)
-                if not packet:
-                    raise ConnectionError("Camera disconnected.")
-                buf += packet
+        # Start Networking Thread
+        recv_thread = threading.Thread(target=receive_loop, args=(conn, decoder), daemon=True)
+        recv_thread.start()
 
-            msg_size = struct.unpack('Q', buf[:header_size])[0]
-            buf = buf[header_size:]
+        def inference_loop():
+            fps_counter = 0
+            fps_timer = time.time()
 
-            # ── Read H.264 NAL payload ───────────────────────────────────────
-            while len(buf) < msg_size:
-                packet = conn.recv(65536)
-                if not packet:
-                    raise ConnectionError("Camera disconnected mid-frame.")
-                buf += packet
+            while True:
+                loop_start = time.time() # Start timing the frame cadence
 
-            nal_bytes = buf[:msg_size]
-            buf = buf[msg_size:]
+                frame = decoder.get_frame()
+                if frame is None:
+                    time.sleep(0.005) # Prevent CPU spinning
+                    continue
 
-            # ── Decode H.264 → BGR ───────────────────────────────────────────
-            frame = decoder.decode(nal_bytes)
+                # Run Inference
+                results = model(frame, verbose=False, device=device)
+                confidences = [b.conf[0].item() for r in results for b in r.boxes]
+                conf = compute_confidence(confidences)
 
-            if frame is None:
-                # Still buffering initial GOP — send neutral metric + empty heatmap
-                empty_heat = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
-                conn.sendall(encode_response(0.5, empty_heat, []))
-                continue
-
-            # ── YOLO inference ───────────────────────────────────────────────
-            results = model(frame, verbose=False, device=device)
-            confidences = [
-                box.conf[0].item()
-                for r in results
-                for box in r.boxes
-            ]
-            metric = compute_metric(confidences)
-
-            # Build person heatmap (binary) and boxes list
-            h, w = frame.shape[:2]
-            heatmap = np.zeros((h, w), dtype=np.uint8)
-            person_boxes = []
-            if results and results[0].boxes is not None and len(results[0].boxes) > 0:
-                boxes = results[0].boxes
-                for i in range(len(boxes)):
-                    cls_id = int(boxes.cls[i].item())
-                    cls_name = results[0].names.get(cls_id, str(cls_id))
-                    if cls_name != "person":
-                        continue
-                    conf = float(boxes.conf[i].item())
-                    x1, y1, x2, y2 = boxes.xyxy[i].tolist()
-                    x1 = max(0, min(w - 1, int(x1)))
-                    y1 = max(0, min(h - 1, int(y1)))
-                    x2 = max(0, min(w, int(x2)))
-                    y2 = max(0, min(h, int(y2)))
-                    if x2 > x1 and y2 > y1:
-                        heatmap[y1:y2, x1:x2] = 255
-                        person_boxes.append((float(x1), float(y1), float(x2), float(y2), conf))
-
-            # ── Send metric + heatmap + boxes back ───────────────────────────
-            conn.sendall(encode_response(metric, heatmap, person_boxes))
-
-            # ── Optional server-side display ─────────────────────────────────
-            if SHOW_SERVER_WINDOW:
-                annotated = results[0].plot()
-                cv2.imshow('Edge Server: YOLO Inference', annotated)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+                # Send quality feedback back to camera
+                try:
+                    conn.sendall(struct.pack('!f', conf))
+                except (BrokenPipeError, OSError):
                     break
 
-    except ConnectionError as e:
-        print(f"Edge Server: {e}")
+                # Process Bounding Boxes
+                person_boxes = []
+                if results and results[0].boxes is not None:
+                    boxes = results[0].boxes
+                    for i in range(len(boxes)):
+                        if results[0].names.get(int(boxes.cls[i].item()), '') == 'person':
+                            c = float(boxes.conf[i].item())
+                            x1, y1, x2, y2 = boxes.xyxy[i].tolist()
+                            person_boxes.append((x1, y1, x2, y2, c))
+
+                # Update Internal FPS metric
+                fps_counter += 1
+                if time.time() - fps_timer >= 1.0:
+                    with shared_lock:
+                        shared_state['fps'] = fps_counter / (time.time() - fps_timer)
+                    fps_counter = 0
+                    fps_timer = time.time()
+
+                # Build annotated frame
+                annotated = frame.copy()
+                with shared_lock:
+                    current_fps = shared_state['fps']
+                draw_hud(annotated, "Edge Server — YOLO Inference", conf, person_boxes, current_fps)
+
+                # Update state for main display thread
+                with shared_lock:
+                    shared_state['display_frame'] = annotated
+                    shared_state['conf'] = conf
+                    shared_state['person_boxes'] = person_boxes
+
+                # --- PACING LOGIC ---
+                # Ensure we don't process faster than real-time (30 FPS)
+                elapsed = time.time() - loop_start
+                sleep_time = FRAME_DURATION - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
+        inf_thread = threading.Thread(target=inference_loop, daemon=True)
+        inf_thread.start()
+
+        # ── Main Thread: Display Loop ────────────────────────────────────────
+        last_display_time = time.time()
+        while True:
+            if SHOW_SERVER_WINDOW:
+                now = time.time()
+                if now - last_display_time >= FRAME_DURATION:
+                    with shared_lock:
+                        display_frame = shared_state['display_frame']
+                    if display_frame is not None:
+                        cv2.imshow('Edge Server — YOLO Inference', display_frame)
+                    last_display_time = now
+
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+            else:
+                time.sleep(0.1)
+                if not recv_thread.is_alive():
+                    break
+
+    except Exception as e:
+        print(f"Main Error: {e}")
     finally:
         decoder.close()
-        try:
-            conn.close()
-        except Exception:
-            pass
         server_socket.close()
         cv2.destroyAllWindows()
         print("Edge Server: shutdown complete.")
-
 
 if __name__ == '__main__':
     main()
