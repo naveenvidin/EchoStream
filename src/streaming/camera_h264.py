@@ -12,26 +12,24 @@ from src.optical_flow.motion_masker import OpticalFlowMasker
 SERVER_IP = 'localhost'
 PORT = 9999
 FIXED_CRF = None
-FRAMES_PER_SEGMENT = 30
-FPS = 30
+FRAMES_PER_SEGMENT = 30 # 1 second segments at 30 FPS
 WIDTH, HEIGHT = 640, 480
 LOG_BANDWIDTH_EVERY_SEC = 60
-CRF_CHANGE_THRESHOLD = 4
-CRF_RANGE = (18, 51)
-INITIAL_CRF = 28
+INITIAL_CRF = 23
 
 
 # ─────────────────────────────────────────────
 #  Segment Encoder
 # ─────────────────────────────────────────────
 class SegmentEncoder:
-    def __init__(self, width: int, height: int, fps: int = 30, gop: int = 30):
+    def __init__(self, width: int, height: int, gop: int = 30):
         self.width = width
         self.height = height
-        self.fps = fps
+        self.fps = gop # should be same as gop, changed to fps for readability
         self.gop = gop
 
     def _build_cmd(self, crf: int) -> list[str]:
+        #ffmpeg commandline, each second has its own encoder instance so we can adjust CRF per segment
         return [
             'ffmpeg', '-loglevel', 'quiet',
             '-f', 'rawvideo',
@@ -66,41 +64,42 @@ class SegmentEncoder:
 #  Confidence Listener
 # ─────────────────────────────────────────────
 class ConfidenceListener:
-    def __init__(self, sock: socket.socket, initial_crf: int,
-                 crf_range: tuple = (18, 51), change_threshold: int = 4):
+    # responsible for receiving confidence scores from the server and translating them to CRF values for the encoder
+    def __init__(self, sock: socket.socket):
         self.sock = sock
-        self.crf_range = crf_range
-        self.change_threshold = change_threshold
-        self._current_crf = initial_crf
-        self._next_crf = initial_crf
+        self._current_crf = INITIAL_CRF
+        self._next_crf = INITIAL_CRF
         self._lock = threading.Lock()
+        self._stop = threading.Event()
         self._thread = threading.Thread(target=self._listen, daemon=True)
-        self._thread.start()
+        self._thread.start() # start background listening immediately
 
     def _conf_to_crf(self, conf: float) -> int:
-        if conf >= 0.8:
-            return 42
-        elif conf >= 0.5:
-            return int(28 + (conf - 0.5) / 0.3 * 14)
-        else:
-            low, _ = self.crf_range
-            return int(low + (conf / 0.5) * 10)
+        # evenly map confidence [0.0, 1.0] to CRF [23, 28, 33, 38, 43]
+        levels = [23, 28, 33, 38, 43]
+        index = min(int(conf * 5), 4)
+        return levels[index]
 
     def _listen(self):
-        while True:
+        while not self._stop.is_set():
             try:
                 data = _recv_exact(self.sock, 4)
                 conf = struct.unpack('!f', data)[0]
                 conf = max(0.0, min(1.0, conf))
                 new_crf = self._conf_to_crf(conf)
                 with self._lock:
-                    if abs(new_crf - self._current_crf) > self.change_threshold:
-                        self._next_crf = new_crf
-            except (ConnectionError, struct.error):
+                    # in bg thread
+                    self._next_crf = new_crf
+            except (ConnectionError, struct.error, OSError):
                 break
+
+    def stop(self):
+        # for clean shutdown
+        self._stop.set()
 
     def get_next_crf(self) -> int:
         with self._lock:
+            # in main thread, called by composer and encoder workers
             self._current_crf = self._next_crf
             return self._current_crf
 
@@ -118,12 +117,15 @@ def _recv_exact(sock: socket.socket, size: int) -> bytes:
         received += len(chunk)
     return b''.join(chunks)
 
-
+# TODO: make this optional to the user, adds overhead but has useful info
 def estimate_baseline_bytes(frame: np.ndarray, crf: int) -> int:
+    '''
+    rough estimation of what the segment size would be if encoded at a baseline CRF (for bandwidth comparison)
+    still uses opencv jpeg in relation to the crf, but can still be misleading
+    '''
     jpeg_q = max(5, min(95, 100 - crf * 2))
     ok, enc = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])
     return len(enc) if ok else 0
-
 
 def draw_hud(frame: np.ndarray, label: str, crf: int, conf: float,
              roi_ratio: float, sent_kb: float, mode: str) -> np.ndarray:
@@ -147,11 +149,11 @@ def draw_hud(frame: np.ndarray, label: str, crf: int, conf: float,
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 255, 120), 1, cv2.LINE_AA)
     return frame
 
-
 # ─────────────────────────────────────────────
 #  Main
 # ─────────────────────────────────────────────
 def main():
+    # setup camera, network, OpticalFlowMasker, SegmentEncoder, ConfidenceListener
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
@@ -160,18 +162,14 @@ def main():
     client_socket.connect((SERVER_IP, PORT))
 
     masker = OpticalFlowMasker(motion_threshold=3.0, min_contour_area=1200)
-    encoder = SegmentEncoder(width=WIDTH, height=HEIGHT, fps=FPS, gop=FRAMES_PER_SEGMENT)
-    listener = ConfidenceListener(
-        sock=client_socket,
-        initial_crf=INITIAL_CRF,
-        crf_range=CRF_RANGE,
-        change_threshold=CRF_CHANGE_THRESHOLD,
-    )
+    encoder = SegmentEncoder(width=WIDTH, height=HEIGHT, gop=FRAMES_PER_SEGMENT)
+    listener = ConfidenceListener(sock=client_socket)
 
-    # State management
-    encode_queue = queue.Queue(maxsize=3) 
-    shared_lock = threading.Lock()
+    # setup State management
+    encode_queue = queue.Queue(maxsize=3) # stores up to 3 segments to encode, drops if full to avoid memory bloat and latency spikes
     
+    # TODO: consider deleting this, could be unnecessary when on separate camera
+    shared_lock = threading.Lock() # hud drawing stuff
     last_raw = {'frame': None}
     last_roi = {'ratio': 0.0}
     last_sent_kb = {'kb': 0.0}
@@ -203,7 +201,7 @@ def main():
                 draw_hud(temp_panel, "Source — raw camera feed", crf, conf, roi, sent_kb, mode)
                 with shared_lock:
                     shared_panel['frame'] = temp_panel
-            time.sleep(1.0 / FPS)
+            time.sleep(1.0 / FRAMES_PER_SEGMENT)
 
     threading.Thread(target=composer_loop, daemon=True).start()
 
@@ -213,9 +211,10 @@ def main():
             data = encoder.encode(frames, crf)
             if not data: return
             
-            header = struct.pack('!I', len(data)) 
+            header = struct.pack('!I', len(data)) # for recv exact on server side
             client_socket.sendall(header + data)
 
+            # hud stuff
             with conf_lock:
                 conf_state['score'] = listener.get_next_crf() / 51.0
             with shared_lock:
@@ -257,11 +256,11 @@ def main():
 
             # Segment logic
             active_crf = FIXED_CRF if FIXED_CRF is not None else listener.get_next_crf()
-            segment_baseline += estimate_baseline_bytes(frame, active_crf)
+            segment_baseline += estimate_baseline_bytes(frame, active_crf) # accumulate baseline for the whole segment
             segment_frames.append(masked_frame)
 
             if len(segment_frames) >= FRAMES_PER_SEGMENT:
-                # print(f"[Segment] Frames: {len(segment_frames)} | CRF: {active_crf} | Baseline: {segment_baseline/1024:.1f} KB")
+                # a full second is ready, add it to the queue
                 try:
                     encode_queue.put_nowait((segment_frames, active_crf, segment_baseline))
                 except queue.Full:
@@ -287,11 +286,11 @@ def main():
                 if b > 0:
                     print(f"[BW] Sent: {s/1024/1024:.2f}MB | Saved: {(b-s)/b*100:.1f}%")
                 interval_start = time.time()
-
     finally:
         encode_queue.put(None)
+        listener.stop()       # signal thread first
         cap.release()
-        client_socket.close()
+        client_socket.close() # now safe to close
         cv2.destroyAllWindows()
 
 if __name__ == '__main__':

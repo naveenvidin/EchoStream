@@ -51,6 +51,7 @@ class H264Decoder:
         self._reader_thread.start()
 
     def _drain_stdout(self):
+        # Continuously read raw frames from ffmpeg's stdout and push to the queue
         while True:
             raw = self._proc.stdout.read(self._frame_bytes)
             if len(raw) < self._frame_bytes:
@@ -71,6 +72,7 @@ class H264Decoder:
                 pass
 
     def push(self, nal_bytes: bytes):
+        # Write raw H.264 NAL unit bytes to ffmpeg's stdin
         try:
             self._proc.stdin.write(nal_bytes)
             self._proc.stdin.flush()
@@ -107,7 +109,8 @@ def _recv_exact(conn, size):
     return b''.join(chunks)
 
 def receive_loop(conn, decoder):
-    """Expects [4-byte length prefix] + [H.264 data segment]"""
+    """Expects [4-byte length prefix] + [H.264 data segment]
+    in a thread to continuously feed the decoder with incoming video data."""
     while True:
         try:
             header = _recv_exact(conn, 4)
@@ -128,6 +131,7 @@ def receive_loop(conn, decoder):
 #  Inference/HUD Helpers
 # ─────────────────────────────────────────────
 def compute_confidence(confidences: list) -> float:
+    # gets min of list of detection confidences, or defaults to 0.5 if no detections
     if not confidences:
         return 0.5
     return float(min(confidences))
@@ -159,6 +163,7 @@ def draw_hud(frame: np.ndarray, label: str, conf: float,
 #  Main Execution
 # ─────────────────────────────────────────────
 def main():
+    # device and model setup
     device = 'mps' if torch.backends.mps.is_available() else 'cpu'
     if torch.cuda.is_available(): device = 'cuda'
     
@@ -192,15 +197,13 @@ def main():
             fps_timer = time.time()
 
             while True:
-                loop_start = time.time() # Start timing the frame cadence
-
                 frame = decoder.get_frame()
                 if frame is None:
                     time.sleep(0.005) # Prevent CPU spinning
                     continue
 
                 # Run Inference
-                results = model(frame, verbose=False, device=device)
+                results = model(frame, verbose=False, device=device) # thank god its fast enough to keep up with 30 FPS
                 confidences = [b.conf[0].item() for r in results for b in r.boxes]
                 conf = compute_confidence(confidences)
 
@@ -248,11 +251,13 @@ def main():
         inf_thread.start()
 
         # ── Main Thread: Display Loop ────────────────────────────────────────
+        #TODO: consider sending annotated frames to a queue and having this thread read from it, instead of shared state with locks. 
+        # Would be more decoupled and less prone to stutter if inference occasionally takes longer than frame pacing.
         last_display_time = time.time()
         while True:
             if SHOW_SERVER_WINDOW:
                 now = time.time()
-                if now - last_display_time >= FRAME_DURATION:
+                if now - last_display_time >= FRAME_DURATION: # tries to update display at same pacing as inference loop
                     with shared_lock:
                         display_frame = shared_state['display_frame']
                     if display_frame is not None:
