@@ -8,6 +8,12 @@ The server still replies with:
 
 Only the detector is additive: fixed YOLOv8n is replaced by YOLO-World
 with prompted classes supplied on the server CLI.
+
+Threading model:
+    Thread 1 - receive_loop:   reads H.264 segments from socket → decoder.push()
+    Thread 2 - _drain_stdout:  reads decoded BGr frames from ffmpeg → frame_q
+    Thread 3 - inference_loop: frame_q → detector.infer() → send conf → result_q
+    Main thread:               result_q → draw_hud → cv2.imshow → waitKey(1)
 """
 from __future__ import annotations
 
@@ -27,7 +33,6 @@ import numpy as np
 PORT = 9999
 WIDTH, HEIGHT = 640, 480
 FPS = 30
-FRAME_DURATION = 1000 // FPS
 
 log = logging.getLogger("echostream.server")
 
@@ -133,6 +138,34 @@ def receive_loop(conn, decoder):
             break
 
 
+def inference_loop(decoder, detector, conn, result_q, stop_event):
+    """Pull frames from decoder, run inference, send conf, push results for display."""
+    while not stop_event.is_set():
+        frame = decoder.get_frame()
+        if frame is None:
+            time.sleep(0.005)
+            continue
+
+        conf, _heatmap, detections, _infer_us = detector.infer(frame)
+
+        try:
+            conn.sendall(struct.pack("!f", float(conf)))
+        except (BrokenPipeError, OSError):
+            stop_event.set()
+            break
+
+        # Drop stale results if display is falling behind
+        if result_q.full():
+            try:
+                result_q.get_nowait()
+            except queue.Empty:
+                pass
+        try:
+            result_q.put_nowait((frame, conf, detections))
+        except queue.Full:
+            pass
+
+
 def draw_hud(frame: np.ndarray, label: str, conf: float,
              detections: list, class_names: list[str], fps: float) -> np.ndarray:
     h, w = frame.shape[:2]
@@ -214,36 +247,43 @@ def main():
         conn, addr = server_socket.accept()
         log.info("connection from %s", addr)
 
+        stop_event = threading.Event()
+        result_q = queue.Queue(maxsize=FPS * 3)
+
         recv_thread = threading.Thread(
             target=receive_loop, args=(conn, decoder), daemon=True,
         )
+        infer_thread = threading.Thread(
+            target=inference_loop,
+            args=(decoder, detector, conn, result_q, stop_event),
+            daemon=True,
+        )
         recv_thread.start()
+        infer_thread.start()
 
         fps_counter = 0
         fps_timer = time.time()
         current_fps = 0.0
 
-        while True:
-            frame = decoder.get_frame()
-            if frame is None:
-                time.sleep(0.005)
-                if not recv_thread.is_alive():
-                    break
-                continue
-
-            conf, _heatmap, detections, _infer_us = detector.infer(frame)
-            try:
-                conn.sendall(struct.pack("!f", float(conf)))
-            except (BrokenPipeError, OSError):
+        while not stop_event.is_set():
+            if not infer_thread.is_alive():
                 break
 
-            fps_counter += 1
-            if time.time() - fps_timer >= 1.0:
-                current_fps = fps_counter / max(time.time() - fps_timer, 1e-6)
-                fps_counter = 0
-                fps_timer = time.time()
-
             if args.show_window:
+                try:
+                    frame, conf, detections = result_q.get(timeout=0.1)
+                except queue.Empty:
+                    print("no results yet")
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+                    continue
+
+                fps_counter += 1
+                if time.time() - fps_timer >= 1.0:
+                    current_fps = fps_counter / max(time.time() - fps_timer, 1e-6)
+                    fps_counter = 0
+                    fps_timer = time.time()
+
                 annotated = frame.copy()
                 draw_hud(
                     annotated,
@@ -254,14 +294,16 @@ def main():
                     current_fps,
                 )
                 cv2.imshow("Edge Server - YOLO-World", annotated)
-                if cv2.waitKey(FRAME_DURATION) & 0xFF == ord("q"):
+                if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
-
-            # time.sleep(FRAME_DURATION)
+            else:
+                # No display — just wait for inference thread to finish
+                infer_thread.join(timeout=1.0)
 
     except Exception as e:
         log.warning("server error: %s", e)
     finally:
+        stop_event.set()
         decoder.close()
         if conn is not None:
             try:
