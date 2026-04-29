@@ -27,7 +27,7 @@ import numpy as np
 PORT = 9999
 WIDTH, HEIGHT = 640, 480
 FPS = 30
-FRAME_DURATION = 1.0 / FPS
+FRAME_DURATION = 1000 // FPS
 
 log = logging.getLogger("echostream.server")
 
@@ -253,10 +253,10 @@ def main():
                     current_fps,
                 )
                 cv2.imshow("Edge Server - YOLO-World", annotated)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+                if cv2.waitKey(FRAME_DURATION) & 0xFF == ord("q"):
                     break
 
-            time.sleep(FRAME_DURATION)
+            # time.sleep(FRAME_DURATION)
 
     except Exception as e:
         log.warning("server error: %s", e)
