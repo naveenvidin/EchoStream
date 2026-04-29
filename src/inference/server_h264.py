@@ -37,7 +37,7 @@ class H264Decoder:
         self.width = width
         self.height = height
         self._frame_bytes = width * height * 3
-        self._frame_q = queue.Queue(maxsize=FPS * 2)
+        self._frame_q = queue.Queue(maxsize=FPS * 3)
         self._proc = None
         self._reader_thread = None
         self._start()
@@ -70,6 +70,7 @@ class H264Decoder:
                 (self.height, self.width, 3),
             ).copy()
             if self._frame_q.full():
+                print("full, dropping frames")
                 try:
                     self._frame_q.get_nowait()
                 except queue.Empty:
