@@ -13,7 +13,7 @@ Threading model:
     Thread 1 - receive_loop:   reads H.264 segments from socket → decoder.push()
     Thread 2 - _drain_stdout:  reads decoded BGr frames from ffmpeg → frame_q
     Thread 3 - inference_loop: frame_q → detector.infer() → send conf → result_q
-    Main thread:               result_q → draw_hud → cv2.imshow → waitKey(1)
+    Main thread:               result_q → draw_hud → cv2.imshow → waitKey(1/FPS - inference_time)
 """
 from __future__ import annotations
 
@@ -33,6 +33,7 @@ import numpy as np
 PORT = 9999
 WIDTH, HEIGHT = 640, 480
 FPS = 30
+FRAME_DURATION = 1000 // (FPS/2)  # Aim for ~15 FPS inference to allow some display overhead
 
 log = logging.getLogger("echostream.server")
 
@@ -75,7 +76,7 @@ class H264Decoder:
                 (self.height, self.width, 3),
             ).copy()
             if self._frame_q.full():
-                print("full, dropping frames")
+                print("full, dropping frames in drain, bad")
                 try:
                     self._frame_q.get_nowait()
                 except queue.Empty:
@@ -143,6 +144,7 @@ def inference_loop(decoder, detector, conn, result_q, stop_event):
     while not stop_event.is_set():
         frame = decoder.get_frame()
         if frame is None:
+            print("decoded queue empty, good thing")
             time.sleep(0.005)
             continue
 
@@ -156,6 +158,7 @@ def inference_loop(decoder, detector, conn, result_q, stop_event):
 
         # Drop stale results if display is falling behind
         if result_q.full():
+            print("full, dropping frames in inference, bad")
             try:
                 result_q.get_nowait()
             except queue.Empty:
@@ -266,6 +269,7 @@ def main():
         current_fps = 0.0
 
         while not stop_event.is_set():
+            infer_start = time.perf_counter()
             if not infer_thread.is_alive():
                 break
 
@@ -273,7 +277,7 @@ def main():
                 try:
                     frame, conf, detections = result_q.get(timeout=0.1)
                 except queue.Empty:
-                    print("no results yet")
+                    print("display queue empty, good thing")
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         break
                     continue
@@ -294,7 +298,11 @@ def main():
                     current_fps,
                 )
                 cv2.imshow("Edge Server - YOLO-World", annotated)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+                elapsed = time.perf_counter() - infer_start
+                log.debug(f"Inference+display latency: {elapsed*1000:.1f} ms")
+                wait_time = max(1, 66-int(elapsed*1000))  # Aim for ~15 FPS display
+                log.debug(f"Frame duration - Inference: {wait_time:.1f} ms")
+                if cv2.waitKey(wait_time) & 0xFF == ord("q"):
                     break
             else:
                 # No display — just wait for inference thread to finish
