@@ -76,7 +76,7 @@ class H264Decoder:
                 (self.height, self.width, 3),
             ).copy()
             if self._frame_q.full():
-                print("full, dropping frames in drain, bad")
+                log.debug("full, dropping frames in drain, bad")
                 try:
                     self._frame_q.get_nowait()
                 except queue.Empty:
@@ -144,7 +144,7 @@ def inference_loop(decoder, detector, conn, result_q, stop_event):
     while not stop_event.is_set():
         frame = decoder.get_frame()
         if frame is None:
-            print("decoded queue empty, good thing")
+            log.debug("decoded queue empty, good thing")
             time.sleep(0.005)
             continue
 
@@ -158,7 +158,7 @@ def inference_loop(decoder, detector, conn, result_q, stop_event):
 
         # Drop stale results if display is falling behind
         if result_q.full():
-            print("full, dropping frames in inference, bad")
+            log.debug("full, dropping frames in inference, bad")
             try:
                 result_q.get_nowait()
             except queue.Empty:
@@ -277,7 +277,7 @@ def main():
                 try:
                     frame, conf, detections = result_q.get(timeout=0.1)
                 except queue.Empty:
-                    print("display queue empty, good thing")
+                    log.debug("display queue empty, good thing")
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         break
                     continue
