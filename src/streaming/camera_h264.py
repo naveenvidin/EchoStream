@@ -230,31 +230,24 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="EchoStream compare camera (segmented H.264 + evaluator taps).",
     )
-    p.add_argument("--input", default="0",
-                   help="Webcam index or video path for replay.")
-    p.add_argument("--loop-video", action="store_true",
-                   help="Rewind video input at EOF.")
-    p.add_argument("--max-frames", type=int, default=None)
-    p.add_argument("--server-ip", default=SERVER_IP)
-    p.add_argument("--port", type=int, default=PORT)
-    p.add_argument("--width", type=int, default=WIDTH)
-    p.add_argument("--height", type=int, default=HEIGHT)
-    p.add_argument("--gop", type=int, default=FRAMES_PER_SEGMENT)
-    p.add_argument("--classes", default="person",
-                   help="Prompt list logged with artifacts; server must use matching --classes.")
-    p.add_argument("--model", default="yolov8s-world.pt",
-                   help="Model name logged with artifacts; loaded by the server.")
-    p.add_argument("--save-artifacts", action="store_true")
-    p.add_argument("--output-dir", default=None)
-    p.add_argument("--record-input", default=None,
-                   help="Write post-resize webcam input to an MP4 for replay.")
-    p.add_argument("--record-input-fps", type=float, default=None)
-    p.add_argument("--record-input-max-frames", type=int, default=None)
-    p.add_argument("--response-timeout-sec", type=float, default=2.0,
-                   help="Accepted for CLI compatibility; the compare path "
-                        "receives feedback on its existing listener thread.")
-    p.add_argument("--no-preview", action="store_true")
-    return p.parse_args()
+    p.add_argument("--config", default="configs/default.json",
+                   help="JSON config file with defaults.")
+    # Convenience overrides (optional).
+    p.add_argument("--no-preview", action="store_true",
+                   help="Override no_preview=true (headless).")
+
+    cli = p.parse_args()
+
+    from src.common.config import load_json_config
+    cfg = load_json_config(cli.config)
+    block = cfg.get("camera_h264") if isinstance(cfg, dict) else None
+    if not isinstance(block, dict):
+        raise SystemExit(f"Missing camera_h264 section in config: {cli.config}")
+
+    args = argparse.Namespace(**block)
+    if cli.no_preview:
+        args.no_preview = True
+    return args
 
 
 def main():

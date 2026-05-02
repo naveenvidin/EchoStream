@@ -251,25 +251,29 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="EchoStream compare server (H.264 segments + YOLO-World).",
     )
-    p.add_argument("--tracker", default="kalman",
-                   choices=("kalman", "none"),
-                   help="Box stabilizer: kalman (smooth + coast) or none (raw detections).")
-    p.add_argument("--model", default="yolov8s-world.pt",
-                   help="YOLO-World weights path.")
-    p.add_argument("--classes", default="person",
-                   help="Comma-separated prompted classes, e.g. person,wallet,bed.")
-    p.add_argument("--device", default="auto",
-                   choices=("auto", "cuda", "mps", "cpu"),
-                   help="Inference device.")
-    p.add_argument("--conf-threshold", type=float, default=0.3)
-    p.add_argument("--nms-iou", type=float, default=0.45,
-                   help="NMS IoU threshold (lower = fewer overlapping boxes).")
-    p.add_argument("--port", type=int, default=PORT)
-    p.add_argument("--width", type=int, default=WIDTH)
-    p.add_argument("--height", type=int, default=HEIGHT)
+    p.add_argument("--config", default="configs/default.json",
+                   help="JSON config file with defaults.")
+    # A couple of convenience overrides for quick debugging.
+    p.add_argument("--port", type=int, default=None,
+                   help="Override port from config.")
     p.add_argument("--show-window", action="store_true",
-                   help="Show server-side YOLO annotations.")
-    return p.parse_args()
+                   help="Override show_window=true (server-side preview).")
+
+    cli = p.parse_args()
+
+    from src.common.config import load_json_config
+    cfg = load_json_config(cli.config)
+    block = cfg.get("server_h264") if isinstance(cfg, dict) else None
+    if not isinstance(block, dict):
+        raise SystemExit(f"Missing server_h264 section in config: {cli.config}")
+
+    args = argparse.Namespace(**block)
+    # Apply lightweight overrides.
+    if cli.port is not None:
+        args.port = int(cli.port)
+    if cli.show_window:
+        args.show_window = True
+    return args
 
 
 def main():
