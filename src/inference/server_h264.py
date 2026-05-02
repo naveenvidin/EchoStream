@@ -1,10 +1,12 @@
 """Edge inference server using the compare folder's H.264 segment protocol.
 
-The camera still sends:
+Camera -> server:
     [4-byte big-endian payload length][raw H.264 segment]
 
-The server still replies with:
-    [4-byte float confidence]
+Server -> camera (per decoded frame):
+    [float32 metric][uint16 heat_w][uint16 heat_h][uint16 num_boxes]
+    [heatmap bytes: heat_w*heat_h uint8]
+    [boxes bytes: num_boxes * (x1,y1,x2,y2,conf) float32]
 
 Only the detector is additive: fixed YOLOv8n is replaced by YOLO-World
 with prompted classes supplied on the server CLI.
@@ -160,6 +162,9 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="EchoStream compare server (H.264 segments + YOLO-World).",
     )
+    p.add_argument("--tracker", default="kalman",
+                   choices=("kalman", "none"),
+                   help="Box stabilizer: kalman (smooth + coast) or none (raw detections).")
     p.add_argument("--model", default="yolov8s-world.pt",
                    help="YOLO-World weights path.")
     p.add_argument("--classes", default="person",
@@ -167,7 +172,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="auto",
                    choices=("auto", "cuda", "mps", "cpu"),
                    help="Inference device.")
-    p.add_argument("--conf-threshold", type=float, default=0.05)
+    p.add_argument("--conf-threshold", type=float, default=0.3)
+    p.add_argument("--nms-iou", type=float, default=0.45,
+                   help="NMS IoU threshold (lower = fewer overlapping boxes).")
     p.add_argument("--port", type=int, default=PORT)
     p.add_argument("--width", type=int, default=WIDTH)
     p.add_argument("--height", type=int, default=HEIGHT)
@@ -184,15 +191,26 @@ def main():
     )
 
     from src.inference.detection import YoloWorldDetector, parse_classes
+    from src.inference.tracking.kalman_tracker import KalmanPersonTracker
 
     classes = parse_classes(args.classes) or ["object"]
     detector = YoloWorldDetector(
         model_path=args.model,
         device=args.device,
         conf_threshold=args.conf_threshold,
+        iou_threshold=args.nms_iou,
         heatmap_wh=(80, 60),
     )
     detector.set_classes(classes)
+    person_cls_idx = None
+    try:
+        person_cls_idx = detector.class_names.index("person")
+    except ValueError:
+        person_cls_idx = None
+
+    tracker = None
+    if args.tracker == "kalman":
+        tracker = KalmanPersonTracker(iou_threshold=0.3, max_age=10)
     try:
         detector.warmup(height=args.height, width=args.width)
     except Exception as e:
@@ -231,8 +249,48 @@ def main():
                 continue
 
             conf, _heatmap, detections, _infer_us = detector.infer(frame)
+            person_dets = []
+            if person_cls_idx is not None:
+                for x1, y1, x2, y2, c, cls_idx in detections:
+                    if cls_idx != person_cls_idx:
+                        continue
+                    box = np.array([x1, y1, x2, y2], dtype=np.float32)
+                    person_dets.append((box, float(c)))
+
+            # Choose between raw detections and Kalman-smoothed tracks.
+            boxes_for_wire: list[tuple[float, float, float, float, float]] = []
+            if tracker is None:
+                for box, c in person_dets:
+                    x1, y1, x2, y2 = box.tolist()
+                    boxes_for_wire.append((float(x1), float(y1), float(x2), float(y2), float(c)))
+            else:
+                tracks = tracker.update(person_dets)
+                for t in tracks:
+                    x1, y1, x2, y2 = t.bbox_xyxy.tolist()
+                    boxes_for_wire.append((float(x1), float(y1), float(x2), float(y2), float(t.conf)))
+
+            heat_w, heat_h = detector.heatmap_size
+            heatmap = np.zeros((heat_h, heat_w), dtype=np.uint8)
+            frame_h, frame_w = frame.shape[:2]
+            if boxes_for_wire:
+                sx = heat_w / float(max(frame_w, 1))
+                sy = heat_h / float(max(frame_h, 1))
+                for x1, y1, x2, y2, _c in boxes_for_wire:
+                    hx1 = int(max(0, min(heat_w - 1, np.floor(x1 * sx))))
+                    hy1 = int(max(0, min(heat_h - 1, np.floor(y1 * sy))))
+                    hx2 = int(max(1, min(heat_w, np.ceil(x2 * sx))))
+                    hy2 = int(max(1, min(heat_h, np.ceil(y2 * sy))))
+                    if hx2 > hx1 and hy2 > hy1:
+                        heatmap[hy1:hy2, hx1:hx2] = 255
+
+            # Minimal stage: still send only a float back, but stabilize it
+            # based on active tracks (coasts across short YOLO misses).
+            if boxes_for_wire:
+                conf = float(min(b[4] for b in boxes_for_wire))
             try:
-                conn.sendall(struct.pack("!f", float(conf)))
+                boxes_payload = b"".join(struct.pack("!fffff", *b) for b in boxes_for_wire)
+                header = struct.pack("!fHHH", float(conf), int(heat_w), int(heat_h), int(len(boxes_for_wire)))
+                conn.sendall(header + heatmap.tobytes() + boxes_payload)
             except (BrokenPipeError, OSError):
                 break
 
@@ -244,12 +302,17 @@ def main():
 
             if args.show_window:
                 annotated = frame.copy()
+                tracked_dets = []
+                tracked_names = detector.class_names
+                if person_cls_idx is not None:
+                    for x1, y1, x2, y2, c in boxes_for_wire:
+                        tracked_dets.append((x1, y1, x2, y2, float(c), int(person_cls_idx)))
                 draw_hud(
                     annotated,
                     "Edge Server - YOLO-World",
                     conf,
-                    detections,
-                    detector.class_names,
+                    tracked_dets,
+                    tracked_names,
                     current_fps,
                 )
                 cv2.imshow("Edge Server - YOLO-World", annotated)
