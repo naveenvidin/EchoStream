@@ -1,49 +1,61 @@
+"""Edge inference server using the compare folder's H.264 segment protocol.
+
+The camera still sends:
+    [4-byte big-endian payload length][raw H.264 segment]
+
+The server still replies with:
+    [4-byte float confidence]
+
+Only the detector is additive: fixed YOLOv8n is replaced by YOLO-World
+with prompted classes supplied on the server CLI.
+
+Threading model:
+    Thread 1 - receive_loop:   reads H.264 segments from socket → decoder.push()
+    Thread 2 - _drain_stdout:  reads decoded BGr frames from ffmpeg → frame_q
+    Thread 3 - inference_loop: frame_q → detector.infer() → send conf → result_q
+    Main thread:               result_q → draw_hud → cv2.imshow → waitKey(1/FPS - inference_time)
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import queue
 import socket
 import struct
 import subprocess
 import threading
-import queue
-import json
-import cv2
-import torch
-import numpy as np
-from ultralytics import YOLO
+import time
 
-# === CONFIGURATION ===
+import cv2
+import numpy as np
+
+
 PORT = 9999
 WIDTH, HEIGHT = 640, 480
-SHOW_SERVER_WINDOW = False
+FPS = 30
+FRAME_DURATION = 1000 // (FPS/2)  # Aim for ~15 FPS inference to allow some display overhead
+
+log = logging.getLogger("echostream.server")
 
 
-# ─────────────────────────────────────────────
-#  H.264 Decoder — persistent ffmpeg subprocess
-# ─────────────────────────────────────────────
 class H264Decoder:
-    """
-    Wraps a single long-lived ffmpeg process that accepts raw H.264 NAL
-    bytes on stdin and outputs BGR24 frames on stdout.
-
-    Uses a background reader thread so stdout never fills its OS pipe
-    buffer while we're waiting to write more input.
-    """
-
-    def __init__(self, width=640, height=480):
+    def __init__(self, width: int = 640, height: int = 480):
         self.width = width
         self.height = height
         self._frame_bytes = width * height * 3
-        self._frame_q = queue.Queue(maxsize=8)
+        self._frame_q = queue.Queue(maxsize=FPS * 3)
         self._proc = None
         self._reader_thread = None
         self._start()
 
     def _start(self):
         cmd = [
-            'ffmpeg', '-loglevel', 'quiet',
-            '-f', 'h264',
-            '-i', 'pipe:0',
-            '-f', 'rawvideo',
-            '-pix_fmt', 'bgr24',
-            'pipe:1',
+            "ffmpeg", "-loglevel", "quiet",
+            "-f", "h264",
+            "-i", "pipe:0",
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "pipe:1",
         ]
         self._proc = subprocess.Popen(
             cmd,
@@ -51,7 +63,7 @@ class H264Decoder:
             stdout=subprocess.PIPE,
         )
         self._reader_thread = threading.Thread(
-            target=self._drain_stdout, daemon=True
+            target=self._drain_stdout, daemon=True,
         )
         self._reader_thread.start()
 
@@ -61,9 +73,10 @@ class H264Decoder:
             if len(raw) < self._frame_bytes:
                 break
             frame = np.frombuffer(raw, dtype=np.uint8).reshape(
-                (self.height, self.width, 3)
+                (self.height, self.width, 3),
             ).copy()
             if self._frame_q.full():
+                log.debug("full, dropping frames in drain, bad")
                 try:
                     self._frame_q.get_nowait()
                 except queue.Empty:
@@ -73,15 +86,16 @@ class H264Decoder:
             except queue.Full:
                 pass
 
-    def decode(self, nal_bytes: bytes):
-        """Push NAL bytes in; return oldest decoded frame or None."""
+    def push(self, nal_bytes: bytes):
         try:
             self._proc.stdin.write(nal_bytes)
             self._proc.stdin.flush()
-        except BrokenPipeError:
-            return None
+        except (BrokenPipeError, OSError):
+            pass
+
+    def get_frame(self):
         try:
-            return self._frame_q.get(timeout=0.05)
+            return self._frame_q.get_nowait()
         except queue.Empty:
             return None
 
@@ -90,155 +104,224 @@ class H264Decoder:
             self._proc.stdin.close()
             self._proc.wait(timeout=3)
         except Exception:
-            self._proc.kill()
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
 
 
-# ─────────────────────────────────────────────
-#  Helpers
-# ─────────────────────────────────────────────
-def recv_exact(sock, size: int) -> bytes:
-    chunks, received = [], 0
-    while received < size:
-        chunk = sock.recv(size - received)
+def _recv_exact(conn, size: int):
+    chunks = []
+    bytes_recvd = 0
+    while bytes_recvd < size:
+        chunk = conn.recv(min(size - bytes_recvd, 4096))
         if not chunk:
-            raise ConnectionError("Camera disconnected.")
+            return None
         chunks.append(chunk)
-        received += len(chunk)
-    return b''.join(chunks)
+        bytes_recvd += len(chunk)
+    return b"".join(chunks)
 
 
-def compute_metric(confidences: list) -> float:
-    """
-    Min confidence → high value = confident scene → camera compresses harder.
-    Returns 0.5 (neutral) when no detections are present.
-    """
-    if not confidences:
-        return 0.5
-    return float(min(confidences))
+def receive_loop(conn, decoder):
+    """Continuously feed length-prefixed H.264 segments into the decoder."""
+    while True:
+        try:
+            header = _recv_exact(conn, 4)
+            if not header:
+                break
+            payload_size = struct.unpack("!I", header)[0]
+            segment_data = _recv_exact(conn, payload_size)
+            if not segment_data:
+                break
+            decoder.push(segment_data)
+        except (ConnectionError, OSError, struct.error) as e:
+            log.warning("receiver connection lost: %s", e)
+            break
 
 
-def encode_response(metric: float, heatmap: np.ndarray, boxes: list) -> bytes:
-    """
-    Pack the response sent back to camera-h264.py.
-    Format:
-      - float32 metric
-      - uint32 width
-      - uint32 height
-      - uint32 num_boxes
-      - heatmap bytes (uint8, H*W)
-      - boxes (num_boxes * 5 float32): x1,y1,x2,y2,conf
-    """
-    h, w = heatmap.shape[:2]
-    payload = struct.pack('!fIII', float(metric), int(w), int(h), int(len(boxes)))
-    payload += heatmap.tobytes()
-    for b in boxes:
-        payload += struct.pack('!fffff', *b)
-    return payload
+def inference_loop(decoder, detector, conn, result_q, stop_event):
+    """Pull frames from decoder, run inference, send conf, push results for display."""
+    while not stop_event.is_set():
+        frame = decoder.get_frame()
+        if frame is None:
+            log.debug("decoded queue empty, good thing")
+            time.sleep(0.005)
+            continue
+
+        conf, _heatmap, detections, _infer_us = detector.infer(frame)
+
+        try:
+            conn.sendall(struct.pack("!f", float(conf)))
+        except (BrokenPipeError, OSError):
+            stop_event.set()
+            break
+
+        # Drop stale results if display is falling behind
+        if result_q.full():
+            log.debug("full, dropping frames in inference, bad")
+            try:
+                result_q.get_nowait()
+            except queue.Empty:
+                pass
+        try:
+            result_q.put_nowait((frame, conf, detections))
+        except queue.Full:
+            pass
 
 
-# ─────────────────────────────────────────────
-#  Main
-# ─────────────────────────────────────────────
+def draw_hud(frame: np.ndarray, label: str, conf: float,
+             detections: list, class_names: list[str], fps: float) -> np.ndarray:
+    h, w = frame.shape[:2]
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (w, 36), (0, 0, 0), -1)
+    cv2.rectangle(overlay, (0, h - 48), (w, h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+
+    cv2.putText(frame, label, (10, 26),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+    stats = f"Conf {conf:.2f}  Processing FPS {fps:.1f}"
+    cv2.putText(frame, stats, (10, h - 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 255, 120), 1, cv2.LINE_AA)
+
+    for (x1, y1, x2, y2, c, cls_idx) in detections:
+        p1 = (int(x1), int(y1))
+        p2 = (int(x2), int(y2))
+        name = class_names[cls_idx] if 0 <= cls_idx < len(class_names) else str(cls_idx)
+        cv2.rectangle(frame, p1, p2, (0, 255, 255), 2)
+        cv2.putText(frame, f"{name} {c:.2f}", (p1[0], max(0, p1[1] - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+    return frame
+
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="EchoStream compare server (H.264 segments + YOLO-World).",
+    )
+    p.add_argument("--model", default="yolov8s-world.pt",
+                   help="YOLO-World weights path.")
+    p.add_argument("--classes", default="person",
+                   help="Comma-separated prompted classes, e.g. person,wallet,bed.")
+    p.add_argument("--device", default="auto",
+                   choices=("auto", "cuda", "mps", "cpu"),
+                   help="Inference device.")
+    p.add_argument("--conf-threshold", type=float, default=0.05)
+    p.add_argument("--port", type=int, default=PORT)
+    p.add_argument("--width", type=int, default=WIDTH)
+    p.add_argument("--height", type=int, default=HEIGHT)
+    p.add_argument("--show-window", action="store_true",
+                   help="Show server-side YOLO annotations.")
+    return p.parse_args()
+
+
 def main():
-    device = 'mps' if torch.backends.mps.is_available() else 'cpu'
-    model = YOLO('yolov8n.pt').to(device)
+    args = _parse_args()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
 
+    from src.inference.detection import YoloWorldDetector, parse_classes
+
+    classes = parse_classes(args.classes) or ["object"]
+    detector = YoloWorldDetector(
+        model_path=args.model,
+        device=args.device,
+        conf_threshold=args.conf_threshold,
+        heatmap_wh=(80, 60),
+    )
+    detector.set_classes(classes)
+    try:
+        detector.warmup(height=args.height, width=args.width)
+    except Exception as e:
+        log.warning("detector warmup skipped: %s", e)
+
+    decoder = H264Decoder(width=args.width, height=args.height)
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind(('0.0.0.0', PORT))
+    server_socket.bind(("0.0.0.0", args.port))
     server_socket.listen(1)
-    print(f"Edge Server: H.264 AI Inference Engine active on port {PORT}")
+    log.info(
+        "listening on 0.0.0.0:%d model=%s classes=%s device=%s",
+        args.port, args.model, classes, detector.device,
+    )
 
-    decoder = H264Decoder(width=WIDTH, height=HEIGHT)
-    header_size = struct.calcsize('Q')
-
+    conn = None
     try:
         conn, addr = server_socket.accept()
-        print(f"Edge Server: connection from {addr}")
-        buf = b''
+        log.info("connection from %s", addr)
 
-        while True:
-            # ── Read frame header ────────────────────────────────────────────
-            while len(buf) < header_size:
-                packet = conn.recv(8192)
-                if not packet:
-                    raise ConnectionError("Camera disconnected.")
-                buf += packet
+        stop_event = threading.Event()
+        result_q = queue.Queue(maxsize=FPS * 3)
 
-            msg_size = struct.unpack('Q', buf[:header_size])[0]
-            buf = buf[header_size:]
+        recv_thread = threading.Thread(
+            target=receive_loop, args=(conn, decoder), daemon=True,
+        )
+        infer_thread = threading.Thread(
+            target=inference_loop,
+            args=(decoder, detector, conn, result_q, stop_event),
+            daemon=True,
+        )
+        recv_thread.start()
+        infer_thread.start()
 
-            # ── Read H.264 NAL payload ───────────────────────────────────────
-            while len(buf) < msg_size:
-                packet = conn.recv(65536)
-                if not packet:
-                    raise ConnectionError("Camera disconnected mid-frame.")
-                buf += packet
+        fps_counter = 0
+        fps_timer = time.time()
+        current_fps = 0.0
 
-            nal_bytes = buf[:msg_size]
-            buf = buf[msg_size:]
+        while not stop_event.is_set():
+            infer_start = time.perf_counter()
+            if not infer_thread.is_alive():
+                break
 
-            # ── Decode H.264 → BGR ───────────────────────────────────────────
-            frame = decoder.decode(nal_bytes)
+            if args.show_window:
+                try:
+                    frame, conf, detections = result_q.get(timeout=0.1)
+                except queue.Empty:
+                    log.debug("display queue empty, good thing")
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+                    continue
 
-            if frame is None:
-                # Still buffering initial GOP — send neutral metric + empty heatmap
-                empty_heat = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
-                conn.sendall(encode_response(0.5, empty_heat, []))
-                continue
+                fps_counter += 1
+                if time.time() - fps_timer >= 1.0:
+                    current_fps = fps_counter / max(time.time() - fps_timer, 1e-6)
+                    fps_counter = 0
+                    fps_timer = time.time()
 
-            # ── YOLO inference ───────────────────────────────────────────────
-            results = model(frame, verbose=False, device=device)
-            confidences = [
-                box.conf[0].item()
-                for r in results
-                for box in r.boxes
-            ]
-            metric = compute_metric(confidences)
-
-            # Build person heatmap (binary) and boxes list
-            h, w = frame.shape[:2]
-            heatmap = np.zeros((h, w), dtype=np.uint8)
-            person_boxes = []
-            if results and results[0].boxes is not None and len(results[0].boxes) > 0:
-                boxes = results[0].boxes
-                for i in range(len(boxes)):
-                    cls_id = int(boxes.cls[i].item())
-                    cls_name = results[0].names.get(cls_id, str(cls_id))
-                    if cls_name != "person":
-                        continue
-                    conf = float(boxes.conf[i].item())
-                    x1, y1, x2, y2 = boxes.xyxy[i].tolist()
-                    x1 = max(0, min(w - 1, int(x1)))
-                    y1 = max(0, min(h - 1, int(y1)))
-                    x2 = max(0, min(w, int(x2)))
-                    y2 = max(0, min(h, int(y2)))
-                    if x2 > x1 and y2 > y1:
-                        heatmap[y1:y2, x1:x2] = 255
-                        person_boxes.append((float(x1), float(y1), float(x2), float(y2), conf))
-
-            # ── Send metric + heatmap + boxes back ───────────────────────────
-            conn.sendall(encode_response(metric, heatmap, person_boxes))
-
-            # ── Optional server-side display ─────────────────────────────────
-            if SHOW_SERVER_WINDOW:
-                annotated = results[0].plot()
-                cv2.imshow('Edge Server: YOLO Inference', annotated)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+                annotated = frame.copy()
+                draw_hud(
+                    annotated,
+                    "Edge Server - YOLO-World",
+                    conf,
+                    detections,
+                    detector.class_names,
+                    current_fps,
+                )
+                cv2.imshow("Edge Server - YOLO-World", annotated)
+                elapsed = time.perf_counter() - infer_start
+                log.debug(f"Inference+display latency: {elapsed*1000:.1f} ms")
+                wait_time = max(1, 66-int(elapsed*1000))  # Aim for ~15 FPS display
+                log.debug(f"Frame duration - Inference: {wait_time:.1f} ms")
+                if cv2.waitKey(wait_time) & 0xFF == ord("q"):
                     break
+            else:
+                # No display — just wait for inference thread to finish
+                infer_thread.join(timeout=1.0)
 
-    except ConnectionError as e:
-        print(f"Edge Server: {e}")
+    except Exception as e:
+        log.warning("server error: %s", e)
     finally:
+        stop_event.set()
         decoder.close()
-        try:
-            conn.close()
-        except Exception:
-            pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
         server_socket.close()
         cv2.destroyAllWindows()
-        print("Edge Server: shutdown complete.")
+        log.info("server shutdown complete.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
