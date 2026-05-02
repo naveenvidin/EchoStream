@@ -23,6 +23,12 @@ python -m venv venv
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
+this worked for darius
+```python -m venv venv                              
+source venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
 
 If `streamlit` is not recognized, run it through Python:
 

@@ -10,6 +10,12 @@ Server -> camera (per decoded frame):
 
 Only the detector is additive: fixed YOLOv8n is replaced by YOLO-World
 with prompted classes supplied on the server CLI.
+
+Threading model:
+    Thread 1 - receive_loop:   reads H.264 segments from socket → decoder.push()
+    Thread 2 - _drain_stdout:  reads decoded BGr frames from ffmpeg → frame_q
+    Thread 3 - inference_loop: frame_q → detector.infer() → send conf → result_q
+    Main thread:               result_q → draw_hud → cv2.imshow → waitKey(1/FPS - inference_time)
 """
 from __future__ import annotations
 
@@ -29,7 +35,7 @@ import numpy as np
 PORT = 9999
 WIDTH, HEIGHT = 640, 480
 FPS = 30
-FRAME_DURATION = 1.0 / FPS
+FRAME_DURATION = 1000 // (FPS/2)  # Aim for ~15 FPS inference to allow some display overhead
 
 log = logging.getLogger("echostream.server")
 
@@ -39,7 +45,7 @@ class H264Decoder:
         self.width = width
         self.height = height
         self._frame_bytes = width * height * 3
-        self._frame_q = queue.Queue(maxsize=FPS * 2)
+        self._frame_q = queue.Queue(maxsize=FPS * 3)
         self._proc = None
         self._reader_thread = None
         self._start()
@@ -72,6 +78,7 @@ class H264Decoder:
                 (self.height, self.width, 3),
             ).copy()
             if self._frame_q.full():
+                log.debug("full, dropping frames in drain, bad")
                 try:
                     self._frame_q.get_nowait()
                 except queue.Empty:
@@ -132,6 +139,88 @@ def receive_loop(conn, decoder):
         except (ConnectionError, OSError, struct.error) as e:
             log.warning("receiver connection lost: %s", e)
             break
+
+
+def inference_loop(decoder, detector, conn, result_q, stop_event):
+    """Pull frames from decoder, run inference, send conf, push results for display."""
+    while not stop_event.is_set():
+        frame = decoder.get_frame()
+        if frame is None:
+            log.debug("decoded queue empty, good thing")
+            time.sleep(0.005)
+            continue
+
+        conf, _heatmap, detections, _infer_us = detector.infer(frame)
+        person_dets = []
+        if detector is not None and getattr(detector, "class_names", None):
+            try:
+                person_cls_idx = detector.class_names.index("person")
+            except ValueError:
+                person_cls_idx = None
+        else:
+            person_cls_idx = None
+
+        if person_cls_idx is not None:
+            for x1, y1, x2, y2, c, cls_idx in detections:
+                if cls_idx != person_cls_idx:
+                    continue
+                box = np.array([x1, y1, x2, y2], dtype=np.float32)
+                person_dets.append((box, float(c)))
+
+        boxes_for_wire: list[tuple[float, float, float, float, float]] = []
+        tracker = getattr(detector, "_echostream_tracker", None)
+        if tracker is None:
+            for box, c in person_dets:
+                x1, y1, x2, y2 = box.tolist()
+                boxes_for_wire.append((float(x1), float(y1), float(x2), float(y2), float(c)))
+        else:
+            tracks = tracker.update(person_dets)
+            for t in tracks:
+                x1, y1, x2, y2 = t.bbox_xyxy.tolist()
+                boxes_for_wire.append((float(x1), float(y1), float(x2), float(y2), float(t.conf)))
+
+        heat_w, heat_h = detector.heatmap_size
+        heatmap = np.zeros((heat_h, heat_w), dtype=np.uint8)
+        frame_h, frame_w = frame.shape[:2]
+        if boxes_for_wire:
+            sx = heat_w / float(max(frame_w, 1))
+            sy = heat_h / float(max(frame_h, 1))
+            for x1, y1, x2, y2, _c in boxes_for_wire:
+                hx1 = int(max(0, min(heat_w - 1, np.floor(x1 * sx))))
+                hy1 = int(max(0, min(heat_h - 1, np.floor(y1 * sy))))
+                hx2 = int(max(1, min(heat_w, np.ceil(x2 * sx))))
+                hy2 = int(max(1, min(heat_h, np.ceil(y2 * sy))))
+                if hx2 > hx1 and hy2 > hy1:
+                    heatmap[hy1:hy2, hx1:hx2] = 255
+
+        if boxes_for_wire:
+            conf = float(min(b[4] for b in boxes_for_wire))
+
+        try:
+            boxes_payload = b"".join(struct.pack("!fffff", *b) for b in boxes_for_wire)
+            header = struct.pack(
+                "!fHHH",
+                float(conf),
+                int(heat_w),
+                int(heat_h),
+                int(len(boxes_for_wire)),
+            )
+            conn.sendall(header + heatmap.tobytes() + boxes_payload)
+        except (BrokenPipeError, OSError):
+            stop_event.set()
+            break
+
+        # Drop stale results if display is falling behind
+        if result_q.full():
+            log.debug("full, dropping frames in inference, bad")
+            try:
+                result_q.get_nowait()
+            except queue.Empty:
+                pass
+        try:
+            result_q.put_nowait((frame, conf, boxes_for_wire))
+        except queue.Full:
+            pass
 
 
 def draw_hud(frame: np.ndarray, label: str, conf: float,
@@ -211,6 +300,8 @@ def main():
     tracker = None
     if args.tracker == "kalman":
         tracker = KalmanPersonTracker(iou_threshold=0.3, max_age=10)
+    # Attach tracker to the detector so inference_loop can remain a small closure-free thread target.
+    detector._echostream_tracker = tracker  # type: ignore[attr-defined]
     try:
         detector.warmup(height=args.height, width=args.width)
     except Exception as e:
@@ -231,76 +322,44 @@ def main():
         conn, addr = server_socket.accept()
         log.info("connection from %s", addr)
 
+        stop_event = threading.Event()
+        result_q = queue.Queue(maxsize=FPS * 3)
+
         recv_thread = threading.Thread(
             target=receive_loop, args=(conn, decoder), daemon=True,
         )
+        infer_thread = threading.Thread(
+            target=inference_loop,
+            args=(decoder, detector, conn, result_q, stop_event),
+            daemon=True,
+        )
         recv_thread.start()
+        infer_thread.start()
 
         fps_counter = 0
         fps_timer = time.time()
         current_fps = 0.0
 
-        while True:
-            frame = decoder.get_frame()
-            if frame is None:
-                time.sleep(0.005)
-                if not recv_thread.is_alive():
-                    break
-                continue
-
-            conf, _heatmap, detections, _infer_us = detector.infer(frame)
-            person_dets = []
-            if person_cls_idx is not None:
-                for x1, y1, x2, y2, c, cls_idx in detections:
-                    if cls_idx != person_cls_idx:
-                        continue
-                    box = np.array([x1, y1, x2, y2], dtype=np.float32)
-                    person_dets.append((box, float(c)))
-
-            # Choose between raw detections and Kalman-smoothed tracks.
-            boxes_for_wire: list[tuple[float, float, float, float, float]] = []
-            if tracker is None:
-                for box, c in person_dets:
-                    x1, y1, x2, y2 = box.tolist()
-                    boxes_for_wire.append((float(x1), float(y1), float(x2), float(y2), float(c)))
-            else:
-                tracks = tracker.update(person_dets)
-                for t in tracks:
-                    x1, y1, x2, y2 = t.bbox_xyxy.tolist()
-                    boxes_for_wire.append((float(x1), float(y1), float(x2), float(y2), float(t.conf)))
-
-            heat_w, heat_h = detector.heatmap_size
-            heatmap = np.zeros((heat_h, heat_w), dtype=np.uint8)
-            frame_h, frame_w = frame.shape[:2]
-            if boxes_for_wire:
-                sx = heat_w / float(max(frame_w, 1))
-                sy = heat_h / float(max(frame_h, 1))
-                for x1, y1, x2, y2, _c in boxes_for_wire:
-                    hx1 = int(max(0, min(heat_w - 1, np.floor(x1 * sx))))
-                    hy1 = int(max(0, min(heat_h - 1, np.floor(y1 * sy))))
-                    hx2 = int(max(1, min(heat_w, np.ceil(x2 * sx))))
-                    hy2 = int(max(1, min(heat_h, np.ceil(y2 * sy))))
-                    if hx2 > hx1 and hy2 > hy1:
-                        heatmap[hy1:hy2, hx1:hx2] = 255
-
-            # Minimal stage: still send only a float back, but stabilize it
-            # based on active tracks (coasts across short YOLO misses).
-            if boxes_for_wire:
-                conf = float(min(b[4] for b in boxes_for_wire))
-            try:
-                boxes_payload = b"".join(struct.pack("!fffff", *b) for b in boxes_for_wire)
-                header = struct.pack("!fHHH", float(conf), int(heat_w), int(heat_h), int(len(boxes_for_wire)))
-                conn.sendall(header + heatmap.tobytes() + boxes_payload)
-            except (BrokenPipeError, OSError):
+        while not stop_event.is_set():
+            infer_start = time.perf_counter()
+            if not infer_thread.is_alive():
                 break
 
-            fps_counter += 1
-            if time.time() - fps_timer >= 1.0:
-                current_fps = fps_counter / max(time.time() - fps_timer, 1e-6)
-                fps_counter = 0
-                fps_timer = time.time()
-
             if args.show_window:
+                try:
+                    frame, conf, boxes_for_wire = result_q.get(timeout=0.1)
+                except queue.Empty:
+                    log.debug("display queue empty, good thing")
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+                    continue
+
+                fps_counter += 1
+                if time.time() - fps_timer >= 1.0:
+                    current_fps = fps_counter / max(time.time() - fps_timer, 1e-6)
+                    fps_counter = 0
+                    fps_timer = time.time()
+
                 annotated = frame.copy()
                 tracked_dets = []
                 tracked_names = detector.class_names
@@ -316,14 +375,20 @@ def main():
                     current_fps,
                 )
                 cv2.imshow("Edge Server - YOLO-World", annotated)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+                elapsed = time.perf_counter() - infer_start
+                log.debug(f"Inference+display latency: {elapsed*1000:.1f} ms")
+                wait_time = max(1, 66-int(elapsed*1000))  # Aim for ~15 FPS display
+                log.debug(f"Frame duration - Inference: {wait_time:.1f} ms")
+                if cv2.waitKey(wait_time) & 0xFF == ord("q"):
                     break
-
-            time.sleep(FRAME_DURATION)
+            else:
+                # No display — just wait for inference thread to finish
+                infer_thread.join(timeout=1.0)
 
     except Exception as e:
         log.warning("server error: %s", e)
     finally:
+        stop_event.set()
         decoder.close()
         if conn is not None:
             try:
