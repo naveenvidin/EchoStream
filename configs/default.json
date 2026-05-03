@@ -1,0 +1,34 @@
+{
+  "camera_h264": {
+    "input": "0",
+    "loop_video": false,
+    "max_frames": null,
+    "server_ip": "localhost",
+    "port": 9999,
+    "width": 640,
+    "height": 480,
+    "gop": 15,
+    "classes": "person",
+    "model": "yolov8s-world.pt",
+    "save_artifacts": false,
+    "output_dir": null,
+    "record_input": null,
+    "record_input_fps": null,
+    "record_input_max_frames": null,
+    "response_timeout_sec": 2.0,
+    "no_preview": false
+  },
+  "server_h264": {
+    "tracker": "kalman",
+    "model": "yolov8s-world.pt",
+    "classes": "person",
+    "device": "auto",
+    "conf_threshold": 0.3,
+    "nms_iou": 0.45,
+    "port": 9999,
+    "width": 640,
+    "height": 480,
+    "show_window": true
+  }
+}
+

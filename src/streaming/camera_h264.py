@@ -27,6 +27,8 @@ INITIAL_CRF = 23
 
 log = logging.getLogger("echostream.camera")
 
+SHOW_YOLO_BOXES = True
+
 
 class SegmentEncoder:
     def __init__(self, width: int, height: int, gop: int = 30):
@@ -73,6 +75,8 @@ class ConfidenceListener:
         self._current_crf = INITIAL_CRF
         self._next_crf = INITIAL_CRF
         self._latest_conf = 0.5
+        self._latest_heatmap = None
+        self._latest_boxes = []
         self._responses = 0
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -87,13 +91,36 @@ class ConfidenceListener:
     def _listen(self):
         while not self._stop.is_set():
             try:
-                data = _recv_exact(self.sock, 4)
-                conf = struct.unpack("!f", data)[0]
+                header = _recv_exact(self.sock, 10)
+                conf, heat_w, heat_h, num_boxes = struct.unpack("!fHHH", header)
                 conf = max(0.0, min(1.0, conf))
+                heat_w = int(heat_w)
+                heat_h = int(heat_h)
+                num_boxes = int(num_boxes)
+
+                heat_bytes = _recv_exact(self.sock, heat_w * heat_h) if heat_w and heat_h else b""
+                heatmap = None
+                if heat_bytes and len(heat_bytes) == heat_w * heat_h:
+                    heatmap = (
+                        np.frombuffer(heat_bytes, dtype=np.uint8)
+                        .reshape((heat_h, heat_w))
+                        .astype(np.float32) / 255.0
+                    )
+
+                boxes = []
+                if num_boxes:
+                    box_bytes = _recv_exact(self.sock, num_boxes * 20)
+                    for i in range(num_boxes):
+                        off = i * 20
+                        x1, y1, x2, y2, c = struct.unpack("!fffff", box_bytes[off:off + 20])
+                        boxes.append((x1, y1, x2, y2, c))
+
                 new_crf = self._conf_to_crf(conf)
                 with self._lock:
                     self._latest_conf = conf
                     self._next_crf = new_crf
+                    self._latest_heatmap = heatmap
+                    self._latest_boxes = boxes
                     self._responses += 1
                 if self.counters is not None:
                     self.counters.record_response_received()
@@ -111,6 +138,14 @@ class ConfidenceListener:
     def latest_confidence(self) -> float:
         with self._lock:
             return float(self._latest_conf)
+
+    def latest_object_score_map(self):
+        with self._lock:
+            return None if self._latest_heatmap is None else self._latest_heatmap.copy()
+
+    def latest_boxes(self):
+        with self._lock:
+            return list(self._latest_boxes)
 
 
 def _recv_exact(sock: socket.socket, size: int) -> bytes:
@@ -195,31 +230,24 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="EchoStream compare camera (segmented H.264 + evaluator taps).",
     )
-    p.add_argument("--input", default="0",
-                   help="Webcam index or video path for replay.")
-    p.add_argument("--loop-video", action="store_true",
-                   help="Rewind video input at EOF.")
-    p.add_argument("--max-frames", type=int, default=None)
-    p.add_argument("--server-ip", default=SERVER_IP)
-    p.add_argument("--port", type=int, default=PORT)
-    p.add_argument("--width", type=int, default=WIDTH)
-    p.add_argument("--height", type=int, default=HEIGHT)
-    p.add_argument("--gop", type=int, default=FRAMES_PER_SEGMENT)
-    p.add_argument("--classes", default="person",
-                   help="Prompt list logged with artifacts; server must use matching --classes.")
-    p.add_argument("--model", default="yolov8s-world.pt",
-                   help="Model name logged with artifacts; loaded by the server.")
-    p.add_argument("--save-artifacts", action="store_true")
-    p.add_argument("--output-dir", default=None)
-    p.add_argument("--record-input", default=None,
-                   help="Write post-resize webcam input to an MP4 for replay.")
-    p.add_argument("--record-input-fps", type=float, default=None)
-    p.add_argument("--record-input-max-frames", type=int, default=None)
-    p.add_argument("--response-timeout-sec", type=float, default=2.0,
-                   help="Accepted for CLI compatibility; the compare path "
-                        "receives feedback on its existing listener thread.")
-    p.add_argument("--no-preview", action="store_true")
-    return p.parse_args()
+    p.add_argument("--config", default="configs/default.json",
+                   help="JSON config file with defaults.")
+    # Convenience overrides (optional).
+    p.add_argument("--no-preview", action="store_true",
+                   help="Override no_preview=true (headless).")
+
+    cli = p.parse_args()
+
+    from src.common.config import load_json_config
+    cfg = load_json_config(cli.config)
+    block = cfg.get("camera_h264") if isinstance(cfg, dict) else None
+    if not isinstance(block, dict):
+        raise SystemExit(f"Missing camera_h264 section in config: {cli.config}")
+
+    args = argparse.Namespace(**block)
+    if cli.no_preview:
+        args.no_preview = True
+    return args
 
 
 def main():
@@ -317,6 +345,7 @@ def main():
                 sent_kb = last_sent_kb["kb"]
                 crf = last_crf["crf"]
             conf = listener.latest_confidence()
+            boxes = listener.latest_boxes()
             if raw is not None:
                 raw_panel = raw.copy()
                 draw_hud(raw_panel, "Source - raw camera feed",
@@ -325,6 +354,21 @@ def main():
                     masked_panel = masked.copy()
                     draw_hud(masked_panel, "Masked - ROI prepared stream",
                              crf, conf, roi, sent_kb, mode)
+                    if SHOW_YOLO_BOXES:
+                        for (x1, y1, x2, y2, c) in boxes:
+                            p1 = (int(x1), int(y1))
+                            p2 = (int(x2), int(y2))
+                            cv2.rectangle(masked_panel, p1, p2, (0, 255, 255), 2)
+                            cv2.putText(
+                                masked_panel,
+                                f"person {c:.2f}",
+                                (p1[0], max(0, p1[1] - 8)),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.5,
+                                (0, 255, 255),
+                                1,
+                                cv2.LINE_AA,
+                            )
                     temp_panel = cv2.hconcat([raw_panel, masked_panel])
                 else:
                     temp_panel = raw_panel
@@ -450,7 +494,8 @@ def main():
                 recorder.write(frame)
 
             t_flow = time.perf_counter()
-            masked_frame, roi_ratio = masker.apply(frame)
+            object_score_map = listener.latest_object_score_map()
+            masked_frame, roi_ratio = masker.apply(frame, object_score_map=object_score_map)
             flow_ms = (time.perf_counter() - t_flow) * 1000.0
 
             with shared_lock:
