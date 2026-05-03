@@ -25,9 +25,10 @@ class OpticalFlowMasker:
         max_roi_ratio=0.4,
         soft_cap_percentile=95.0,
         blur_kernel_size=21,
+        low_blur_kernel_size=51,
         importance_alpha=0.3,
         importance_beta=0.7,
-        importance_low_thresh=0.1,
+        importance_low_thresh=0.05,
         importance_high_thresh=0.3,
         motion_norm_percentile=90.0,
     ):
@@ -43,6 +44,7 @@ class OpticalFlowMasker:
         self.max_roi_ratio = max_roi_ratio
         self.soft_cap_percentile = soft_cap_percentile
         self.blur_kernel_size = blur_kernel_size
+        self.low_blur_kernel_size = low_blur_kernel_size
         self.importance_alpha = importance_alpha
         self.importance_beta = importance_beta
         self.importance_low_thresh = importance_low_thresh
@@ -53,15 +55,16 @@ class OpticalFlowMasker:
     def apply(self, frame_bgr, object_score_map=None):
         """
         Returns:
-            masked_frame: composite frame with black/blur/sharp regions
+            masked_frame: composite frame with low-blur / mid-blur / sharp regions
             roi_ratio: fraction of image area covered by mid+high importance
         """
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        blurred = make_blurred(frame_bgr, self.blur_kernel_size)
+        blurred_mid = make_blurred(frame_bgr, self.blur_kernel_size)
+        blurred_low = make_blurred(frame_bgr, self.low_blur_kernel_size)
 
         if self.prev_gray is None:
             self.prev_gray = gray
-            return blurred.copy(), 0.0
+            return blurred_low.copy(), 0.0
 
         flow = compute_flow(
             self.prev_gray,
@@ -92,11 +95,13 @@ class OpticalFlowMasker:
             self.importance_high_thresh,
             self.max_roi_ratio,
             self.soft_cap_percentile,
+            valid_mask=(obj_norm <= 0.0) if isinstance(obj_norm, np.ndarray) else None,
         )
 
         masked, roi_ratio = composite_frame(
             frame_bgr,
-            blurred,
+            blurred_mid,
+            blurred_low,
             importance,
             obj_norm,
             low_thresh,

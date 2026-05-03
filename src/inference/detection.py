@@ -61,10 +61,12 @@ class YoloWorldDetector:
 
     def __init__(self, model_path: str = "yolov8s-world.pt",
                  device: str = "auto", conf_threshold: float = 0.05,
+                 iou_threshold: float = 0.45,
                  heatmap_wh: Tuple[int, int] = (80, 60)):
         self.model_path = model_path
         self.device = select_device(device)
         self.conf_threshold = float(conf_threshold)
+        self.iou_threshold = float(iou_threshold)
         self._class_names: List[str] = []
         self._heat_w = int(heatmap_wh[0]) or 80
         self._heat_h = int(heatmap_wh[1]) or 60
@@ -123,6 +125,7 @@ class YoloWorldDetector:
         results = self._model.predict(
             frame_bgr, verbose=False, device=self.device,
             conf=self.conf_threshold,
+            iou=self.iou_threshold,
         )
 
         metric = 0.5
