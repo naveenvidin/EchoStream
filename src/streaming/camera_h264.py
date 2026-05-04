@@ -24,6 +24,16 @@ FRAMES_PER_SEGMENT = 30
 WIDTH, HEIGHT = 640, 480
 LOG_BANDWIDTH_EVERY_SEC = 60
 INITIAL_CRF = 23
+MIN_CRF = 18
+MAX_CRF = 43
+TARGET_CONFIDENCE = 0.65
+CONFIDENCE_DEADBAND = 0.03
+CRF_KP = 6.0
+CRF_KI = 0.5
+CRF_INTEGRAL_LIMIT = 1.0
+MAX_CRF_STEP = 2
+EMERGENCY_CONFIDENCE = 0.30
+EMERGENCY_CRF_STEP = 4
 
 log = logging.getLogger("echostream.camera")
 
@@ -74,25 +84,48 @@ class ConfidenceListener:
         self.counters = counters
         self._current_crf = INITIAL_CRF
         self._next_crf = INITIAL_CRF
+        self._crf_integral = 0.0
         self._latest_conf = 0.5
         self._latest_heatmap = None
         self._latest_boxes = []
+        self._latest_segment_id = -1
         self._responses = 0
+        self._pending_segments: dict[int, int] = {}
+        self._segment_confidences: dict[int, float] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._listen, daemon=True)
         self._thread.start()
 
-    def _conf_to_crf(self, conf: float) -> int:
-        levels = [23, 28, 33, 38, 43]
-        index = min(int(conf * 5), 4)
-        return levels[index]
+    def _update_crf(self, conf: float) -> int:
+        error = TARGET_CONFIDENCE - conf
+        if abs(error) < CONFIDENCE_DEADBAND:
+            error = 0.0
+
+        if error and self._crf_integral and (error > 0) != (self._crf_integral > 0):
+            self._crf_integral = 0.0
+        self._crf_integral = max(
+            -CRF_INTEGRAL_LIMIT,
+            min(CRF_INTEGRAL_LIMIT, self._crf_integral + error),
+        )
+        delta = CRF_KP * error + CRF_KI * self._crf_integral
+
+        step = int(round(-delta))
+        step = max(-MAX_CRF_STEP, min(MAX_CRF_STEP, step))
+        if conf < EMERGENCY_CONFIDENCE:
+            step = min(step, -EMERGENCY_CRF_STEP)
+
+        return max(MIN_CRF, min(MAX_CRF, self._next_crf + step))
 
     def _listen(self):
         while not self._stop.is_set():
             try:
-                header = _recv_exact(self.sock, 10)
-                conf, heat_w, heat_h, num_boxes = struct.unpack("!fHHH", header)
+                header = _recv_exact(self.sock, 14)
+                segment_id, conf, heat_w, heat_h, num_boxes = struct.unpack("!IfHHH", header)
+                if not np.isfinite(conf):
+                    if self.counters is not None:
+                        self.counters.record_invalid_response()
+                    continue
                 conf = max(0.0, min(1.0, conf))
                 heat_w = int(heat_w)
                 heat_h = int(heat_h)
@@ -115,20 +148,33 @@ class ConfidenceListener:
                         x1, y1, x2, y2, c = struct.unpack("!fffff", box_bytes[off:off + 20])
                         boxes.append((x1, y1, x2, y2, c))
 
-                new_crf = self._conf_to_crf(conf)
                 with self._lock:
+                    frame_count = self._pending_segments.pop(segment_id, None)
+                    new_crf = self._update_crf(conf)
                     self._latest_conf = conf
+                    self._latest_segment_id = int(segment_id)
+                    self._segment_confidences[int(segment_id)] = conf
                     self._next_crf = new_crf
                     self._latest_heatmap = heatmap
                     self._latest_boxes = boxes
                     self._responses += 1
                 if self.counters is not None:
-                    self.counters.record_response_received()
+                    if frame_count is None:
+                        self.counters.record_stale_response()
+                    else:
+                        self.counters.record_response_received(frame_count)
             except (ConnectionError, struct.error, OSError):
                 break
 
     def stop(self):
         self._stop.set()
+
+    def expect_segment(self, segment_id: int, frame_count: int) -> None:
+        frame_count = max(1, int(frame_count))
+        with self._lock:
+            self._pending_segments[int(segment_id)] = frame_count
+        if self.counters is not None:
+            self.counters.record_response_expected(frame_count)
 
     def get_next_crf(self) -> int:
         with self._lock:
@@ -146,6 +192,10 @@ class ConfidenceListener:
     def latest_boxes(self):
         with self._lock:
             return list(self._latest_boxes)
+    def confidence_for_segment(self, segment_id: int, default: float | None = None) -> float:
+        with self._lock:
+            fallback = self._latest_conf if default is None else default
+            return float(self._segment_confidences.get(int(segment_id), fallback))
 
 
 def _recv_exact(sock: socket.socket, size: int) -> bytes:
@@ -378,21 +428,24 @@ def main():
 
     threading.Thread(target=composer_loop, daemon=True).start()
 
-    def encode_and_send(segment_items, crf, baseline_total, transition_count):
+    def encode_and_send(segment_id, segment_items, crf, baseline_total, transition_count):
         try:
             frames = [item["masked"] for item in segment_items]
             t_enc = time.perf_counter()
             data = encoder.encode(frames, crf)
             encode_ms_total = (time.perf_counter() - t_enc) * 1000.0
-            counters.record_encode(produced_packet=bool(data))
+            counters.record_encode(
+                produced_packet=bool(data),
+                frame_count=len(segment_items),
+            )
             if not data:
                 return
 
-            header = struct.pack("!I", len(data))
+            header = struct.pack("!II", int(segment_id), len(data))
+            listener.expect_segment(segment_id, len(segment_items))
             t_send = time.perf_counter()
             client_socket.sendall(header + data)
             send_ms = (time.perf_counter() - t_send) * 1000.0
-            counters.record_response_expected()
 
             with shared_lock:
                 last_sent_kb["kb"] = len(data) / 1024
@@ -417,9 +470,10 @@ def main():
                 e2e_ms = (time.perf_counter() - item["loop_ts"]) * 1000.0
                 artifacts.log_frame(
                     frame_index=item["frame_index"],
+                    sequence_id=segment_id,
                     input_source=input_source,
                     roi_ratio=item["roi_ratio"],
-                    conf_metric=listener.latest_confidence(),
+                    conf_metric=listener.confidence_for_segment(segment_id),
                     crf=crf,
                     encoded_bytes=encoded_bytes,
                     num_detections=0,
@@ -459,6 +513,9 @@ def main():
     interval_start = time.time()
     segment_items = []
     segment_baseline = 0
+    next_segment_id = 0
+    current_segment_id = None
+    current_segment_crf = None
     frame_index = 0
 
     try:
@@ -503,14 +560,19 @@ def main():
                 last_masked["frame"] = masked_frame.copy()
                 last_roi["ratio"] = roi_ratio
 
-            active_crf = FIXED_CRF if FIXED_CRF is not None else listener.get_next_crf()
-            if crf_transition_count["prev"] is None:
-                crf_transition_count["prev"] = active_crf
-            elif active_crf != crf_transition_count["prev"]:
-                crf_transition_count["count"] += 1
-                crf_transition_count["prev"] = active_crf
+            if not segment_items:
+                current_segment_id = next_segment_id
+                next_segment_id += 1
+                current_segment_crf = (
+                    FIXED_CRF if FIXED_CRF is not None else listener.get_next_crf()
+                )
+                if crf_transition_count["prev"] is None:
+                    crf_transition_count["prev"] = current_segment_crf
+                elif current_segment_crf != crf_transition_count["prev"]:
+                    crf_transition_count["count"] += 1
+                    crf_transition_count["prev"] = current_segment_crf
 
-            segment_baseline += estimate_baseline_bytes(frame, active_crf)
+            segment_baseline += estimate_baseline_bytes(frame, current_segment_crf)
             segment_items.append({
                 "frame_index": frame_index,
                 "original": frame.copy(),
@@ -524,8 +586,9 @@ def main():
             if len(segment_items) >= args.gop:
                 try:
                     encode_queue.put_nowait((
+                        current_segment_id,
                         segment_items,
-                        active_crf,
+                        current_segment_crf,
                         segment_baseline,
                         crf_transition_count["count"],
                     ))
@@ -533,6 +596,8 @@ def main():
                     log.warning("drop segment")
                 segment_items = []
                 segment_baseline = 0
+                current_segment_id = None
+                current_segment_crf = None
 
             if not args.no_preview:
                 with shared_lock:
@@ -558,10 +623,10 @@ def main():
     finally:
         if segment_items:
             try:
-                active_crf = FIXED_CRF if FIXED_CRF is not None else listener.get_next_crf()
                 encode_queue.put((
+                    current_segment_id,
                     segment_items,
-                    active_crf,
+                    current_segment_crf,
                     segment_baseline,
                     crf_transition_count["count"],
                 ), timeout=2.0)
