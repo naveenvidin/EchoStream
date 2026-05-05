@@ -7,7 +7,6 @@
     "port": 9999,
     "width": 640,
     "height": 480,
-    "gop": 15,
     "classes": "person",
     "model": "yolov8s-world.pt",
     "save_artifacts": false,
