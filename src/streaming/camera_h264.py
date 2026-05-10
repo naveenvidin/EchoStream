@@ -34,7 +34,7 @@ class SegmentEncoder:
     GOP size matches FPS so each segment is exactly one keyframe-aligned group.
     """
 
-    def __init__(self, width: int, height: int, gop: int = 30):
+    def __init__(self, width: int, height: int, gop: int):
         self.width = width
         self.height = height
         self.fps = gop
@@ -216,11 +216,12 @@ def _open_input(spec: str, width: int, height: int):
         cap = cv2.VideoCapture(idx)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        return cap, f"webcam:{idx}", (cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        cap.set(cv2.CAP_PROP_FPS, 15) # force a common FPS for webcams since many don't report it correctly; actual FPS may vary
+        return cap, f"webcam:{idx}", 15
     cap = cv2.VideoCapture(spec)
     if not cap.isOpened():
         raise IOError(f"Cannot open video file: {spec}")
-    return cap, f"file:{spec}", (cap.get(cv2.CAP_PROP_FPS) or 30.0)
+    return cap, f"file:{spec}", cap.get(cv2.CAP_PROP_FPS)
 
 
 def _decode_h264_segment(data: bytes, width: int, height: int) -> list[np.ndarray]:
@@ -289,7 +290,9 @@ def main():
 
     classes = parse_classes(args.classes) or ["object"]
     cap, input_source, probed_fps = _open_input(args.input, args.width, args.height)
-    fps = probed_fps if probed_fps > 1 else 30.0
+    if probed_fps <= 0:
+        raise ValueError(f"Could not determine FPS of input source '{args.input}'. ")
+    fps = probed_fps
 
     client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     client_socket.connect((args.server_ip, args.port))

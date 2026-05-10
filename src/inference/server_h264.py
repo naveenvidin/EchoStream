@@ -341,7 +341,7 @@ def main():
         fps = struct.unpack("!f", fps_bytes)[0]
         frame_duration_ms = int(1000 / fps)
         # log.info("FPS handshake received: %.2f  frame_duration_ms=%d", fps, frame_duration_ms)
-        print(f"FPS handshake received: {fps:.2f}  frame_duration_ms={frame_duration_ms}")
+        log.info("FPS handshake received: %.2f  frame_duration_ms=%d", fps, frame_duration_ms)
 
         # Decoder queue sized to ~3 seconds at negotiated FPS.
         decoder = H264Decoder(width=args.width, height=args.height, fps=fps)
@@ -401,7 +401,7 @@ def main():
                 cv2.imshow("Edge Server - YOLO-World", annotated)
 
                 elapsed = time.perf_counter() - infer_start
-                log.debug(f"Inference+display latency: {elapsed*1000:.1f} ms")
+                # log.debug(f"Inference+display latency: {elapsed*1000:.1f} ms")
 
                 # Pace display to the negotiated FPS; clamp to at least 1ms for waitKey.
                 wait_time = max(1, frame_duration_ms - int(elapsed * 1000))
