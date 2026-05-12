@@ -22,9 +22,11 @@ import time
 from typing import List, Sequence, Tuple
 
 import numpy as np
+import logging
 
 
 Detection = Tuple[float, float, float, float, float, int]
+log = logging.getLogger("echostream.detector")
 
 
 def select_device(preference: str = "auto") -> str:
@@ -70,9 +72,31 @@ class YoloWorldDetector:
         self._class_names: List[str] = []
         self._heat_w = int(heatmap_wh[0]) or 80
         self._heat_h = int(heatmap_wh[1]) or 60
+        self._is_world = False
+        # For non-world fallback, map the model's class ids into the "prompt"
+        # class id space (0..len(class_names)-1) expected by the rest of the app.
+        self._model_cls_to_out_cls: dict[int, int] = {}
 
-        from ultralytics import YOLOWorld  # noqa: WPS433
-        self._model = YOLOWorld(model_path)
+        # YOLO-World depends on `clip`. If it's missing (common on fresh envs),
+        # fall back to a standard COCO YOLO model so the pipeline still runs.
+        try:
+            from ultralytics import YOLOWorld  # noqa: WPS433
+            self._model = YOLOWorld(model_path)
+            self._is_world = True
+        except ModuleNotFoundError as e:
+            if "clip" not in str(e):
+                raise
+            from ultralytics import YOLO  # noqa: WPS433
+            fallback = model_path
+            # YOLO-World weights don't load correctly in plain YOLO.
+            if fallback.endswith("-world.pt") or fallback.endswith("world.pt"):
+                fallback = "yolov8n.pt"
+            log.warning(
+                "YOLO-World unavailable (%s). Falling back to YOLO model=%s",
+                e, fallback,
+            )
+            self._model = YOLO(fallback)
+            self._is_world = False
         try:
             self._model.to(self.device)
         except Exception:
@@ -95,7 +119,24 @@ class YoloWorldDetector:
         if not cleaned:
             cleaned = ["object"]
         self._class_names = cleaned
-        self._model.set_classes(cleaned)
+        self._model_cls_to_out_cls = {}
+        if self._is_world:
+            self._model.set_classes(cleaned)
+            # YOLO-World emits cls ids in the prompt space already (0..N-1).
+            self._model_cls_to_out_cls = {i: i for i in range(len(cleaned))}
+            return
+
+        # Plain YOLO (COCO). We approximate "set_classes" by filtering predict()
+        # and remapping model class ids → our output class ids.
+        # This keeps the rest of the server logic consistent.
+        names_map = getattr(self._model, "names", None) or {}
+        # ultralytics names is typically a dict[int,str]
+        str_to_id = {str(v): int(k) for k, v in dict(names_map).items()}
+        for out_idx, cname in enumerate(cleaned):
+            cid = str_to_id.get(cname)
+            if cid is None:
+                continue
+            self._model_cls_to_out_cls[int(cid)] = int(out_idx)
 
     def warmup(self, height: int = 480, width: int = 640, runs: int = 2) -> None:
         """Flush first-run overhead — cuDNN autotune, graph build, etc."""
@@ -107,6 +148,7 @@ class YoloWorldDetector:
                 self._model.predict(
                     dummy, verbose=False, device=self.device,
                     conf=self.conf_threshold,
+                    iou=self.iou_threshold,
                 )
             except Exception:
                 break
@@ -126,6 +168,7 @@ class YoloWorldDetector:
             frame_bgr, verbose=False, device=self.device,
             conf=self.conf_threshold,
             iou=self.iou_threshold,
+            classes=(list(self._model_cls_to_out_cls.keys()) if (not self._is_world and self._model_cls_to_out_cls) else None),
         )
 
         metric = 0.5
@@ -163,9 +206,16 @@ class YoloWorldDetector:
                     heatmap[hy1[i]:hy2[i], hx1[i]:hx2[i]] = 255
                 c = float(confs[i])
                 kept_confs.append(c)
+                cls_i = int(clses[i])
+                if not self._is_world and self._model_cls_to_out_cls:
+                    # Remap COCO class id → prompt space id (0..len(class_names)-1)
+                    out_cls = self._model_cls_to_out_cls.get(cls_i)
+                    if out_cls is None:
+                        continue
+                    cls_i = int(out_cls)
                 detections.append(
                     (float(x1i), float(y1i), float(x2i), float(y2i),
-                     c, int(clses[i]))
+                     c, int(cls_i))
                 )
             if kept_confs:
                 # Use the minimum confidence so the camera's quality loop

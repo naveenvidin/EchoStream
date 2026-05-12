@@ -21,7 +21,6 @@ class OpticalFlowMasker:
         dis_preset=cv2.DISOPTICAL_FLOW_PRESET_MEDIUM,
         compensate_global_motion=True,
         global_flow_mode="affine",
-        warp_mode="flow",
         max_roi_ratio=0.4,
         soft_cap_percentile=95.0,
         blur_kernel_size=21,
@@ -39,8 +38,6 @@ class OpticalFlowMasker:
         self.dis = cv2.DISOpticalFlow_create(dis_preset)
         self.compensate_global_motion = compensate_global_motion
         self.global_flow_mode = global_flow_mode
-        # warp_mode options: "flow" (per-pixel flow warp) or "affine" (global affine warp)
-        self.warp_mode = warp_mode
         self.max_roi_ratio = max_roi_ratio
         self.soft_cap_percentile = soft_cap_percentile
         self.blur_kernel_size = blur_kernel_size
@@ -72,7 +69,6 @@ class OpticalFlowMasker:
             self.dis,
             compensate_global_motion=self.compensate_global_motion,
             global_flow_mode=self.global_flow_mode,
-            warp_mode=self.warp_mode,
         )
 
         magnitude, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
