@@ -1,22 +1,16 @@
-"""Edge inference server using the compare folder's H.264 segment protocol.
+"""Edge inference server using segmented H.264 feedback.
 
 Camera -> server:
     [4-byte big-endian float: camera FPS]           (handshake, sent once on connect)
-    [4-byte big-endian payload length][raw H.264 segment]  (repeated)
+    [uint32 segment_id][uint32 payload length][raw H.264 segment]  (repeated)
 
-Server -> camera (per decoded frame):
-    [float32 metric][uint16 heat_w][uint16 heat_h][uint16 num_boxes]
+Server -> camera (per segment):
+    [uint32 segment_id][float32 p10_conf][uint16 heat_w][uint16 heat_h][uint16 num_boxes]
     [heatmap bytes: heat_w*heat_h uint8]
     [boxes bytes: num_boxes * (x1,y1,x2,y2,conf) float32]
 
 Only the detector is additive: fixed YOLOv8n is replaced by YOLO-World
 with prompted classes supplied on the server CLI.
-
-Threading model:
-    Thread 1 - receive_loop:   reads H.264 segments from socket → decoder.push()
-    Thread 2 - _drain_stdout:  reads decoded BGR frames from ffmpeg → frame_q
-    Thread 3 - inference_loop: frame_q → detector.infer() → send conf → result_q
-    Main thread:               result_q → draw_hud → cv2.imshow → waitKey
 """
 from __future__ import annotations
 
@@ -39,89 +33,6 @@ WIDTH, HEIGHT = 640, 480
 log = logging.getLogger("echostream.server")
 
 
-class H264Decoder:
-    """Persistent ffmpeg subprocess that accepts raw H.264 bytes and emits decoded
-    BGR frames into an internal queue for downstream consumption.
-    """
-
-    def __init__(self, width: int = 640, height: int = 480, fps: float = 15.0):
-        self.width = width
-        self.height = height
-        self.fps = fps
-        self._frame_bytes = width * height * 3
-        # Queue sized to hold ~3 seconds of frames at the negotiated FPS.
-        self._frame_q = queue.Queue(maxsize=int(fps * 3))
-        self._proc = None
-        self._reader_thread = None
-        self._start()
-
-    def _start(self):
-        cmd = [
-            "ffmpeg", "-loglevel", "quiet",
-            "-f", "h264",
-            "-i", "pipe:0",
-            "-f", "rawvideo",
-            "-pix_fmt", "bgr24",
-            "pipe:1",
-        ]
-        self._proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-        )
-        self._reader_thread = threading.Thread(
-            target=self._drain_stdout, daemon=True,
-        )
-        self._reader_thread.start()
-
-    def _drain_stdout(self):
-        """Read decoded frames from ffmpeg stdout and push them to the frame queue.
-        If the queue is full, drop the oldest frame to make room so the producer
-        never blocks on a slow consumer.
-        """
-        while True:
-            raw = self._proc.stdout.read(self._frame_bytes)
-            if len(raw) < self._frame_bytes:
-                break
-            frame = np.frombuffer(raw, dtype=np.uint8).reshape(
-                (self.height, self.width, 3),
-            ).copy()
-            if self._frame_q.full():
-                log.info("full, dropping frames in drain, bad")
-                try:
-                    self._frame_q.get_nowait()
-                except queue.Empty:
-                    pass
-            try:
-                self._frame_q.put_nowait(frame)
-            except queue.Full:
-                pass
-
-    def push(self, nal_bytes: bytes):
-        """Write a raw H.264 segment into the ffmpeg decoder's stdin."""
-        try:
-            self._proc.stdin.write(nal_bytes)
-            self._proc.stdin.flush()
-        except (BrokenPipeError, OSError):
-            pass
-
-    def get_frame(self):
-        try:
-            return self._frame_q.get_nowait()
-        except queue.Empty:
-            return None
-
-    def close(self):
-        try:
-            self._proc.stdin.close()
-            self._proc.wait(timeout=3)
-        except Exception:
-            try:
-                self._proc.kill()
-            except Exception:
-                pass
-
-
 def _recv_exact(conn, size: int):
     chunks = []
     bytes_recvd = 0
@@ -134,107 +45,92 @@ def _recv_exact(conn, size: int):
     return b"".join(chunks)
 
 
-def receive_loop(conn, decoder):
-    """Read length-prefixed H.264 segments from the socket and push each into the decoder."""
-    while True:
-        try:
-            header = _recv_exact(conn, 4)
-            if not header:
-                break
-            payload_size = struct.unpack("!I", header)[0]
-            segment_data = _recv_exact(conn, payload_size)
-            if not segment_data:
-                break
-            decoder.push(segment_data)
-        except (ConnectionError, OSError, struct.error) as e:
-            log.warning("receiver connection lost: %s", e)
-            break
+def _decode_h264_segment(data: bytes, width: int, height: int) -> list[np.ndarray]:
+    if not data:
+        return []
+    cmd = [
+        "ffmpeg", "-loglevel", "quiet",
+        "-f", "h264",
+        "-i", "pipe:0",
+        "-f", "rawvideo",
+        "-pix_fmt", "bgr24",
+        "pipe:1",
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    raw, _ = proc.communicate(input=data)
+    frame_bytes = width * height * 3
+    frames = []
+    for off in range(0, len(raw) - frame_bytes + 1, frame_bytes):
+        frames.append(
+            np.frombuffer(raw[off:off + frame_bytes], dtype=np.uint8)
+            .reshape((height, width, 3))
+            .copy()
+        )
+    return frames
 
 
-def inference_loop(decoder, detector, conn, result_q, stop_event):
-    """Pull decoded frames from the decoder, run YOLO inference, send the result
-    back to the camera over the socket, and push annotated frames to result_q for display.
-    Drops frames from result_q when the display thread falls behind.
-    """
-    while not stop_event.is_set():
-        frame = decoder.get_frame()
-        if frame is None:
-            # commented cause it's expected that the queue will be empty at times and we don't want to spam logs
-            # log.info("decoded queue empty, good thing")
-            time.sleep(0.005)
-            continue
+def receive_segment(conn):
+    header = _recv_exact(conn, 8)
+    if not header:
+        return None
+    segment_id, payload_size = struct.unpack("!II", header)
+    segment_data = _recv_exact(conn, payload_size)
+    if not segment_data:
+        return None
+    return int(segment_id), segment_data
 
-        conf, _heatmap, detections, _infer_us = detector.infer(frame)
-        person_dets = []
-        if detector is not None and getattr(detector, "class_names", None):
-            try:
-                person_cls_idx = detector.class_names.index("person")
-            except ValueError:
-                person_cls_idx = None
-        else:
-            person_cls_idx = None
 
-        if person_cls_idx is not None:
-            for x1, y1, x2, y2, c, cls_idx in detections:
-                if cls_idx != person_cls_idx:
-                    continue
-                box = np.array([x1, y1, x2, y2], dtype=np.float32)
-                person_dets.append((box, float(c)))
+def person_boxes_for_wire(detector, detections, person_cls_idx):
+    person_dets = []
+    if person_cls_idx is not None:
+        for x1, y1, x2, y2, c, cls_idx in detections:
+            if cls_idx != person_cls_idx:
+                continue
+            box = np.array([x1, y1, x2, y2], dtype=np.float32)
+            person_dets.append((box, float(c)))
 
-        boxes_for_wire: list[tuple[float, float, float, float, float]] = []
-        tracker = getattr(detector, "_echostream_tracker", None)
-        if tracker is None:
-            for box, c in person_dets:
-                x1, y1, x2, y2 = box.tolist()
-                boxes_for_wire.append((float(x1), float(y1), float(x2), float(y2), float(c)))
-        else:
-            tracks = tracker.update(person_dets)
-            for t in tracks:
-                x1, y1, x2, y2 = t.bbox_xyxy.tolist()
-                boxes_for_wire.append((float(x1), float(y1), float(x2), float(y2), float(t.conf)))
+    boxes_for_wire: list[tuple[float, float, float, float, float]] = []
+    tracker = getattr(detector, "_echostream_tracker", None)
+    if tracker is None:
+        for box, c in person_dets:
+            x1, y1, x2, y2 = box.tolist()
+            boxes_for_wire.append((float(x1), float(y1), float(x2), float(y2), float(c)))
+    else:
+        tracks = tracker.update(person_dets)
+        for t in tracks:
+            x1, y1, x2, y2 = t.bbox_xyxy.tolist()
+            boxes_for_wire.append((float(x1), float(y1), float(x2), float(y2), float(t.conf)))
+    return boxes_for_wire
 
-        heat_w, heat_h = detector.heatmap_size
-        heatmap = np.zeros((heat_h, heat_w), dtype=np.uint8)
-        frame_h, frame_w = frame.shape[:2]
-        if boxes_for_wire:
-            sx = heat_w / float(max(frame_w, 1))
-            sy = heat_h / float(max(frame_h, 1))
-            for x1, y1, x2, y2, _c in boxes_for_wire:
-                hx1 = int(max(0, min(heat_w - 1, np.floor(x1 * sx))))
-                hy1 = int(max(0, min(heat_h - 1, np.floor(y1 * sy))))
-                hx2 = int(max(1, min(heat_w, np.ceil(x2 * sx))))
-                hy2 = int(max(1, min(heat_h, np.ceil(y2 * sy))))
-                if hx2 > hx1 and hy2 > hy1:
-                    heatmap[hy1:hy2, hx1:hx2] = 255
 
-        if boxes_for_wire:
-            conf = float(min(b[4] for b in boxes_for_wire))
+def boxes_to_heatmap(boxes_for_wire, frame_shape, heat_w: int, heat_h: int) -> np.ndarray:
+    heatmap = np.zeros((heat_h, heat_w), dtype=np.uint8)
+    frame_h, frame_w = frame_shape[:2]
+    if boxes_for_wire:
+        sx = heat_w / float(max(frame_w, 1))
+        sy = heat_h / float(max(frame_h, 1))
+        for x1, y1, x2, y2, _c in boxes_for_wire:
+            hx1 = int(max(0, min(heat_w - 1, np.floor(x1 * sx))))
+            hy1 = int(max(0, min(heat_h - 1, np.floor(y1 * sy))))
+            hx2 = int(max(1, min(heat_w, np.ceil(x2 * sx))))
+            hy2 = int(max(1, min(heat_h, np.ceil(y2 * sy))))
+            if hx2 > hx1 and hy2 > hy1:
+                heatmap[hy1:hy2, hx1:hx2] = 255
+    return heatmap
 
-        try:
-            boxes_payload = b"".join(struct.pack("!fffff", *b) for b in boxes_for_wire)
-            header = struct.pack(
-                "!fHHH",
-                float(conf),
-                int(heat_w),
-                int(heat_h),
-                int(len(boxes_for_wire)),
-            )
-            conn.sendall(header + heatmap.tobytes() + boxes_payload)
-        except (BrokenPipeError, OSError):
-            stop_event.set()
-            break
 
-        # Drop stale results if display is falling behind.
-        if result_q.full():
-            log.info("full, dropping frames in inference, bad")
-            try:
-                result_q.get_nowait()
-            except queue.Empty:
-                pass
-        try:
-            result_q.put_nowait((frame, conf, boxes_for_wire))
-        except queue.Full:
-            pass
+def send_segment_feedback(conn, segment_id: int, conf: float, heatmap: np.ndarray, boxes_for_wire):
+    heat_h, heat_w = heatmap.shape[:2]
+    boxes_payload = b"".join(struct.pack("!fffff", *b) for b in boxes_for_wire)
+    header = struct.pack(
+        "!IfHHH",
+        int(segment_id),
+        float(conf),
+        int(heat_w),
+        int(heat_h),
+        int(len(boxes_for_wire)),
+    )
+    conn.sendall(header + heatmap.tobytes() + boxes_payload)
 
 
 def draw_hud(frame: np.ndarray, label: str, conf: float,
@@ -333,6 +229,8 @@ def main():
     )
 
     conn = None
+    worker_thread = None
+    stop_event = threading.Event()
     try:
         conn, addr = server_socket.accept()
         log.info("connection from %s", addr)
@@ -341,44 +239,85 @@ def main():
         fps_bytes = _recv_exact(conn, 4)
         fps = struct.unpack("!f", fps_bytes)[0]
         frame_duration_ms = int(1000 / fps)
-<<<<<<< HEAD
-        # log.info("FPS handshake received: %.2f  frame_duration_ms=%d", fps, frame_duration_ms)
-=======
->>>>>>> main
         log.info("FPS handshake received: %.2f  frame_duration_ms=%d", fps, frame_duration_ms)
 
-        # Decoder queue sized to ~3 seconds at negotiated FPS.
-        decoder = H264Decoder(width=args.width, height=args.height, fps=fps)
-
-        stop_event = threading.Event()
-        result_q = queue.Queue(maxsize=int(fps * 3))
-
-        recv_thread = threading.Thread(
-            target=receive_loop, args=(conn, decoder), daemon=True,
-        )
-        infer_thread = threading.Thread(
-            target=inference_loop,
-            args=(decoder, detector, conn, result_q, stop_event),
-            daemon=True,
-        )
-        recv_thread.start()
-        infer_thread.start()
+        result_q = queue.Queue(maxsize=int(max(fps, 1) * 3))
 
         fps_counter = 0
         fps_timer = time.time()
         current_fps = 0.0
 
-        while not stop_event.is_set():
-            infer_start = time.perf_counter()
-            if not infer_thread.is_alive():
-                break
+        def process_segments():
+            while not stop_event.is_set():
+                try:
+                    received = receive_segment(conn)
+                    if received is None:
+                        break
 
-            if args.show_window:
+                    segment_id, segment_data = received
+                    frames = _decode_h264_segment(segment_data, args.width, args.height)
+                    if not frames:
+                        heat_w, heat_h = detector.heatmap_size
+                        send_segment_feedback(
+                            conn,
+                            segment_id,
+                            0.5,
+                            np.zeros((heat_h, heat_w), dtype=np.uint8),
+                            [],
+                        )
+                        continue
+
+                    frame_confs = []
+                    latest_heatmap = None
+                    latest_boxes_for_wire = []
+                    heat_w, heat_h = detector.heatmap_size
+
+                    for frame in frames:
+                        conf, _heatmap, detections, _infer_us = detector.infer(frame)
+                        boxes_for_wire = person_boxes_for_wire(detector, detections, person_cls_idx)
+                        if boxes_for_wire:
+                            conf = float(min(b[4] for b in boxes_for_wire))
+
+                        frame_confs.append(float(conf))
+                        latest_boxes_for_wire = boxes_for_wire
+                        latest_heatmap = boxes_to_heatmap(boxes_for_wire, frame.shape, heat_w, heat_h)
+
+                        if args.show_window:
+                            if result_q.full():
+                                try:
+                                    result_q.get_nowait()
+                                except queue.Empty:
+                                    pass
+                            try:
+                                result_q.put_nowait((frame, conf, boxes_for_wire))
+                            except queue.Full:
+                                pass
+
+                    segment_conf = float(np.percentile(np.array(frame_confs, dtype=np.float32), 10))
+                    if latest_heatmap is None:
+                        latest_heatmap = np.zeros((heat_h, heat_w), dtype=np.uint8)
+                    send_segment_feedback(
+                        conn,
+                        segment_id,
+                        segment_conf,
+                        latest_heatmap,
+                        latest_boxes_for_wire,
+                    )
+                except (BrokenPipeError, ConnectionError, OSError, struct.error) as e:
+                    log.warning("segment worker stopped: %s", e)
+                    break
+            stop_event.set()
+
+        worker_thread = threading.Thread(target=process_segments, daemon=True)
+        worker_thread.start()
+
+        if args.show_window:
+            while not stop_event.is_set():
                 try:
                     frame, conf, boxes_for_wire = result_q.get(timeout=0.1)
                 except queue.Empty:
-                    log.info("display queue empty, mid thing")
-                    if cv2.waitKey(500) & 0xFF == ord("q"):
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        stop_event.set()
                         break
                     continue
 
@@ -404,23 +343,20 @@ def main():
                 )
                 cv2.imshow("Edge Server - YOLO-World", annotated)
 
-                elapsed = time.perf_counter() - infer_start
-                # log.debug(f"Inference+display latency: {elapsed*1000:.1f} ms")
-
-                # Pace display to the negotiated FPS; clamp to at least 1ms for waitKey.
-                # wait_time = max(1, frame_duration_ms - int(elapsed * 1000))
-                # log.info(f"Frame duration - Inference: {wait_time:.1f} ms")
+                # Pace display to the negotiated FPS without slowing segment feedback.
                 if cv2.waitKey(frame_duration_ms) & 0xFF == ord("q"):
+                    stop_event.set()
                     break
-            else:
-                # No display — just wait for inference thread to finish.
-                infer_thread.join(timeout=1.0)
+        else:
+            while not stop_event.is_set() and worker_thread.is_alive():
+                worker_thread.join(timeout=0.5)
 
     except Exception as e:
         log.warning("server error: %s", e)
     finally:
         stop_event.set()
-        decoder.close()
+        if worker_thread is not None:
+            worker_thread.join(timeout=2.0)
         if conn is not None:
             try:
                 conn.close()
