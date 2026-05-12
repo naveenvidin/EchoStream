@@ -10,7 +10,6 @@
     "baseline_crf": 20,
     "width": 640,
     "height": 480,
-    "gop": 5,
     "classes": "person",
     "model": "yolov8s-world.pt",
     "save_artifacts": false,

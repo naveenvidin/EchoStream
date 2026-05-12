@@ -24,7 +24,6 @@ FIXED_CRF = None
 WIDTH, HEIGHT = 640, 480
 LOG_BANDWIDTH_EVERY_SEC = 60
 INITIAL_CRF = 23
-PREVIEW_FPS = 30
 
 log = logging.getLogger("echostream.camera")
 
@@ -41,8 +40,8 @@ class SegmentEncoder:
         self.height = height
         # Frames-per-second for the rawvideo input to ffmpeg. This must match the
         # real capture cadence; tying it to GOP makes streams appear choppy/slow.
-        self.fps = float(fps or 30.0)
-        self.gop = int(gop or 30)
+        self.fps = float(fps)
+        self.gop = int(gop)
         log.info(
             "SegmentEncoder init width=%d height=%d fps=%.2f gop=%d",
             self.width, self.height, self.fps, self.gop,
@@ -301,12 +300,12 @@ def main():
 
     classes = parse_classes(args.classes) or ["object"]
     cap, input_source, probed_fps = _open_input(args.input, args.width, args.height)
-    fps = float(probed_fps or args.gop or 30.0)
+    fps = float(probed_fps)
 
     masked_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     masked_socket.connect((args.server_ip, args.port))
     # Handshake: tell the server our real capture FPS so it can size queues / timers.
-    masked_socket.sendall(struct.pack("!f", float(fps)))
+    masked_socket.sendall(struct.pack("!f", fps))
 
     baseline_enabled = bool(getattr(args, "baseline_enabled", False))
     baseline_socket = None
@@ -314,11 +313,11 @@ def main():
         baseline_port = int(getattr(args, "baseline_port", args.port))
         baseline_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         baseline_socket.connect((args.server_ip, baseline_port))
-        baseline_socket.sendall(struct.pack("!f", float(fps)))
+        baseline_socket.sendall(struct.pack("!f", fps))
 
     counters = PipelineCounters(expected_fps=fps)
     masker = OpticalFlowMasker(motion_threshold=3.0, min_contour_area=1200)
-    encoder = SegmentEncoder(width=args.width, height=args.height, fps=fps, gop=args.gop)
+    encoder = SegmentEncoder(width=args.width, height=args.height, fps=fps, gop=int(fps))
 
     listener = ConfidenceListener(sock=masked_socket, counters=counters)
     baseline_listener = None
@@ -461,9 +460,8 @@ def main():
                     temp_panel = raw_panel
                 with shared_lock:
                     shared_panel["frame"] = temp_panel
-            # Preview refresh rate should not depend on segment size (GOP),
-            # otherwise the UI becomes choppy when GOP is large.
-            time.sleep(1.0 / max(PREVIEW_FPS, 1))
+
+            time.sleep(1.0 / max(fps, 1))
 
     threading.Thread(target=composer_loop, daemon=True).start()
 
