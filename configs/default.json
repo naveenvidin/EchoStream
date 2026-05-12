@@ -5,9 +5,12 @@
     "max_frames": null,
     "server_ip": "localhost",
     "port": 9999,
+    "baseline_enabled": true,
+    "baseline_port": 9998,
+    "baseline_crf": 20,
     "width": 640,
     "height": 480,
-    "gop": 15,
+    "gop": 5,
     "classes": "person",
     "model": "yolov8s-world.pt",
     "save_artifacts": false,
@@ -16,7 +19,10 @@
     "record_input_fps": null,
     "record_input_max_frames": null,
     "response_timeout_sec": 2.0,
-    "no_preview": false
+    "no_preview": false,
+    "raw_conf_eval": true,
+    "raw_conf_eval_stride": 15,
+    "measure_raw_bandwidth": false
   },
   "server_h264": {
     "tracker": "kalman",
@@ -31,4 +37,3 @@
     "show_window": true
   }
 }
-

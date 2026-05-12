@@ -9,6 +9,7 @@ import subprocess
 import threading
 import time
 from dataclasses import asdict
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -24,6 +25,7 @@ FRAMES_PER_SEGMENT = 30
 WIDTH, HEIGHT = 640, 480
 LOG_BANDWIDTH_EVERY_SEC = 60
 INITIAL_CRF = 23
+PREVIEW_FPS = 30
 
 log = logging.getLogger("echostream.camera")
 
@@ -31,10 +33,12 @@ SHOW_YOLO_BOXES = True
 
 
 class SegmentEncoder:
-    def __init__(self, width: int, height: int, gop: int = 30):
+    def __init__(self, width: int, height: int, fps: float = 30.0, gop: int = 30):
         self.width = width
         self.height = height
-        self.fps = gop
+        # Frames-per-second for the rawvideo input to ffmpeg. This must match the
+        # real capture cadence; tying it to GOP makes streams appear choppy/slow.
+        self.fps = float(fps or 30.0)
         self.gop = gop
 
     def _build_cmd(self, crf: int) -> list[str]:
@@ -146,6 +150,10 @@ class ConfidenceListener:
     def latest_boxes(self):
         with self._lock:
             return list(self._latest_boxes)
+
+    def response_count(self) -> int:
+        with self._lock:
+            return int(self._responses)
 
 
 def _recv_exact(sock: socket.socket, size: int) -> bytes:
@@ -261,19 +269,46 @@ def main():
     from src.eval.pipeline_counters import PipelineCounters
     from src.eval.recorded_input import RawInputRecorder
     from src.eval.video_metrics import write_summary
-    from src.inference.detection import parse_classes
+    from src.inference.detection import YoloWorldDetector, parse_classes
 
     classes = parse_classes(args.classes) or ["object"]
     cap, input_source, probed_fps = _open_input(args.input, args.width, args.height)
     fps = float(probed_fps or args.gop or 30.0)
 
-    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    client_socket.connect((args.server_ip, args.port))
+    masked_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    masked_socket.connect((args.server_ip, args.port))
+
+    baseline_enabled = bool(getattr(args, "baseline_enabled", False))
+    baseline_socket = None
+    if baseline_enabled:
+        baseline_port = int(getattr(args, "baseline_port", args.port))
+        baseline_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        baseline_socket.connect((args.server_ip, baseline_port))
 
     counters = PipelineCounters(expected_fps=fps)
     masker = OpticalFlowMasker(motion_threshold=3.0, min_contour_area=1200)
-    encoder = SegmentEncoder(width=args.width, height=args.height, gop=args.gop)
-    listener = ConfidenceListener(sock=client_socket, counters=counters)
+    encoder = SegmentEncoder(width=args.width, height=args.height, fps=fps, gop=args.gop)
+
+    raw_eval = None
+    if getattr(args, "raw_conf_eval", False):
+        try:
+            raw_eval = YoloWorldDetector(
+                model_path=args.model,
+                device="auto",
+                conf_threshold=0.05,
+                iou_threshold=0.45,
+                heatmap_wh=(80, 60),
+            )
+            raw_eval.set_classes(classes)
+            raw_eval.warmup(height=args.height, width=args.width)
+            log.info("raw_conf_eval enabled (stride=%s)", getattr(args, "raw_conf_eval_stride", 15))
+        except Exception as e:
+            raw_eval = None
+            log.warning("raw_conf_eval disabled: %s", e)
+    listener = ConfidenceListener(sock=masked_socket, counters=counters)
+    baseline_listener = None
+    if baseline_socket is not None:
+        baseline_listener = ConfidenceListener(sock=baseline_socket, counters=None)
 
     run_dir = args.output_dir
     if args.save_artifacts and not run_dir:
@@ -318,17 +353,26 @@ def main():
         log.info("--record-input ignored for file input; use the file path for replay.")
 
     encode_queue = queue.Queue(maxsize=3)
+    baseline_encode_queue = queue.Queue(maxsize=3) if baseline_socket is not None else None
     shared_lock = threading.Lock()
     last_raw = {"frame": None}
     last_masked = {"frame": None}
     last_roi = {"ratio": 0.0}
     last_sent_kb = {"kb": 0.0}
     last_crf = {"crf": INITIAL_CRF}
+    last_baseline_sent_kb = {"kb": 0.0}
+    last_baseline_crf = {"crf": int(getattr(args, "baseline_crf", 20) or 20)}
+    last_raw_boxes = {"boxes": []}
     shared_panel = {"frame": None}
     bw_lock = threading.Lock()
     bw_state = {"sent": 0, "baseline": 0}
+    baseline_bw_state = {"sent": 0}
     mode = "Fixed" if FIXED_CRF is not None else "Adaptive"
     crf_transition_count = {"count": 0, "prev": None}
+
+    # Raw YOLO eval runs on a background thread so it doesn't disturb the main pipeline/UI.
+    raw_eval_q = queue.Queue(maxsize=1)
+    raw_eval_stop = threading.Event()
 
     log.info(
         "ready input=%s classes=%s preview=%s artifacts=%s",
@@ -344,12 +388,40 @@ def main():
                 roi = last_roi["ratio"]
                 sent_kb = last_sent_kb["kb"]
                 crf = last_crf["crf"]
+                base_sent_kb = last_baseline_sent_kb["kb"]
+                base_crf = last_baseline_crf["crf"]
+                raw_boxes = list(last_raw_boxes["boxes"])
             conf = listener.latest_confidence()
             boxes = listener.latest_boxes()
+            base_conf = baseline_listener.latest_confidence() if baseline_listener is not None else None
+            base_boxes = baseline_listener.latest_boxes() if baseline_listener is not None else []
             if raw is not None:
                 raw_panel = raw.copy()
-                draw_hud(raw_panel, "Source - raw camera feed",
-                         crf, conf, roi, sent_kb, mode)
+                # Left panel uses baseline server feedback when available.
+                draw_hud(
+                    raw_panel,
+                    "Baseline - full frame stream",
+                    base_crf,
+                    float(base_conf) if base_conf is not None else 0.0,
+                    1.0,
+                    base_sent_kb,
+                    "Fixed",
+                )
+                if SHOW_YOLO_BOXES and raw_boxes:
+                    for (x1, y1, x2, y2, c) in raw_boxes:
+                        p1 = (int(x1), int(y1))
+                        p2 = (int(x2), int(y2))
+                        cv2.rectangle(raw_panel, p1, p2, (255, 255, 0), 2)
+                        cv2.putText(
+                            raw_panel,
+                            f"raw person {c:.2f}",
+                            (p1[0], max(0, p1[1] - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (255, 255, 0),
+                            1,
+                                cv2.LINE_AA,
+                            )
                 if masked is not None:
                     masked_panel = masked.copy()
                     draw_hud(masked_panel, "Masked - ROI prepared stream",
@@ -367,20 +439,57 @@ def main():
                                 0.5,
                                 (0, 255, 255),
                                 1,
-                                cv2.LINE_AA,
-                            )
+                                    cv2.LINE_AA,
+                                )
                     temp_panel = cv2.hconcat([raw_panel, masked_panel])
                 else:
                     temp_panel = raw_panel
                 with shared_lock:
                     shared_panel["frame"] = temp_panel
-            time.sleep(1.0 / max(args.gop, 1))
+            # Preview refresh rate should not depend on segment size (GOP),
+            # otherwise the UI becomes choppy when GOP is large.
+            time.sleep(1.0 / max(PREVIEW_FPS, 1))
 
     threading.Thread(target=composer_loop, daemon=True).start()
+
+    def raw_eval_worker():
+        if raw_eval is None:
+            return
+        while not raw_eval_stop.is_set():
+            try:
+                item = raw_eval_q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if item is None:
+                raw_eval_q.task_done()
+                break
+            frame_bgr, ts, masked_conf_snapshot = item
+            try:
+                raw_conf, _hm, raw_dets, _us = raw_eval.infer(frame_bgr)
+                raw_conf_samples.append((ts, float(raw_conf)))
+                masked_conf_aligned.append((ts, float(masked_conf_snapshot)))
+
+                raw_boxes = []
+                try:
+                    person_idx = raw_eval.class_names.index("person")
+                except ValueError:
+                    person_idx = None
+                if person_idx is not None:
+                    for x1, y1, x2, y2, c, cls_idx in raw_dets:
+                        if cls_idx != person_idx:
+                            continue
+                        raw_boxes.append((x1, y1, x2, y2, float(c)))
+                with shared_lock:
+                    last_raw_boxes["boxes"] = raw_boxes
+            except Exception:
+                pass
+            finally:
+                raw_eval_q.task_done()
 
     def encode_and_send(segment_items, crf, baseline_total, transition_count):
         try:
             frames = [item["masked"] for item in segment_items]
+            raw_frames = [item["original"] for item in segment_items]
             t_enc = time.perf_counter()
             data = encoder.encode(frames, crf)
             encode_ms_total = (time.perf_counter() - t_enc) * 1000.0
@@ -390,7 +499,7 @@ def main():
 
             header = struct.pack("!I", len(data))
             t_send = time.perf_counter()
-            client_socket.sendall(header + data)
+            masked_socket.sendall(header + data)
             send_ms = (time.perf_counter() - t_send) * 1000.0
             counters.record_response_expected()
 
@@ -400,6 +509,16 @@ def main():
             with bw_lock:
                 bw_state["sent"] += len(data)
                 bw_state["baseline"] += baseline_total
+                masked_bw_samples.append((time.time(), len(data)))
+
+            if getattr(args, "measure_raw_bandwidth", False):
+                # Expensive but accurate: encode raw frames with the same encoder settings.
+                try:
+                    raw_bytes = encoder.encode(raw_frames, crf)
+                    with bw_lock:
+                        raw_bw_samples.append((time.time(), len(raw_bytes)))
+                except Exception:
+                    pass
 
             if artifacts is None:
                 return
@@ -444,6 +563,24 @@ def main():
         except Exception as e:
             log.warning("worker error: %s", e)
 
+    def encode_and_send_baseline(segment_items, crf):
+        if baseline_socket is None:
+            return
+        try:
+            frames = [item["original"] for item in segment_items]
+            data = encoder.encode(frames, crf)
+            if not data:
+                return
+            header = struct.pack("!I", len(data))
+            baseline_socket.sendall(header + data)
+            with shared_lock:
+                last_baseline_sent_kb["kb"] = len(data) / 1024
+                last_baseline_crf["crf"] = crf
+            with bw_lock:
+                baseline_bw_state["sent"] += len(data)
+        except Exception as e:
+            log.warning("baseline worker error: %s", e)
+
     def network_worker():
         while True:
             item = encode_queue.get()
@@ -456,10 +593,36 @@ def main():
     worker = threading.Thread(target=network_worker, daemon=True)
     worker.start()
 
+    baseline_worker = None
+    if baseline_encode_queue is not None:
+        def baseline_network_worker():
+            while True:
+                item = baseline_encode_queue.get()
+                if item is None:
+                    baseline_encode_queue.task_done()
+                    break
+                segment_items, crf = item
+                encode_and_send_baseline(segment_items, crf)
+                baseline_encode_queue.task_done()
+
+        baseline_worker = threading.Thread(target=baseline_network_worker, daemon=True)
+        baseline_worker.start()
+
     interval_start = time.time()
+    stats_window_sec = 60.0
+    raw_conf_samples = deque()     # (ts, conf)
+    masked_conf_samples = deque()  # (ts, conf)
+    masked_conf_aligned = deque()  # (ts, conf) sampled when raw_conf is sampled
+    raw_bw_samples = deque()       # (ts, bytes)
+    masked_bw_samples = deque()    # (ts, bytes)
+    last_masked_response_count = 0
     segment_items = []
     segment_baseline = 0
     frame_index = 0
+    baseline_crf = int(getattr(args, "baseline_crf", 20) or 20)
+
+    if raw_eval is not None:
+        threading.Thread(target=raw_eval_worker, daemon=True).start()
 
     try:
         while True:
@@ -498,6 +661,41 @@ def main():
             masked_frame, roi_ratio = masker.apply(frame, object_score_map=object_score_map)
             flow_ms = (time.perf_counter() - t_flow) * 1000.0
 
+            now = time.time()
+            resp_count = listener.response_count()
+            if resp_count != last_masked_response_count:
+                last_masked_response_count = resp_count
+                masked_conf = listener.latest_confidence()
+                masked_conf_samples.append((now, float(masked_conf)))
+            if raw_eval is not None:
+                stride = int(getattr(args, "raw_conf_eval_stride", 15) or 15)
+                if stride <= 0:
+                    stride = 15
+                if frame_index % stride == 0:
+                    # Snapshot masked confidence and enqueue for background raw eval.
+                    masked_snapshot = float(listener.latest_confidence())
+                    try:
+                        raw_eval_q.put_nowait((frame.copy(), now, masked_snapshot))
+                    except queue.Full:
+                        # Prefer newest sample (drop older one).
+                        try:
+                            _ = raw_eval_q.get_nowait()
+                            raw_eval_q.task_done()
+                        except queue.Empty:
+                            pass
+                        try:
+                            raw_eval_q.put_nowait((frame.copy(), now, masked_snapshot))
+                        except queue.Full:
+                            pass
+
+            cutoff = now - stats_window_sec
+            while raw_conf_samples and raw_conf_samples[0][0] < cutoff:
+                raw_conf_samples.popleft()
+            while masked_conf_samples and masked_conf_samples[0][0] < cutoff:
+                masked_conf_samples.popleft()
+            while masked_conf_aligned and masked_conf_aligned[0][0] < cutoff:
+                masked_conf_aligned.popleft()
+
             with shared_lock:
                 last_raw["frame"] = frame.copy()
                 last_masked["frame"] = masked_frame.copy()
@@ -531,6 +729,11 @@ def main():
                     ))
                 except queue.Full:
                     log.warning("drop segment")
+                if baseline_encode_queue is not None:
+                    try:
+                        baseline_encode_queue.put_nowait((segment_items, baseline_crf))
+                    except queue.Full:
+                        log.warning("drop baseline segment")
                 segment_items = []
                 segment_baseline = 0
 
@@ -547,15 +750,71 @@ def main():
                     sent = bw_state["sent"]
                     baseline = bw_state["baseline"]
                     bw_state["sent"] = bw_state["baseline"] = 0
+                    base_sent = baseline_bw_state["sent"]
+                    baseline_bw_state["sent"] = 0
+                    cutoff = time.time() - stats_window_sec
+                    while masked_bw_samples and masked_bw_samples[0][0] < cutoff:
+                        masked_bw_samples.popleft()
+                    while raw_bw_samples and raw_bw_samples[0][0] < cutoff:
+                        raw_bw_samples.popleft()
                 if baseline > 0:
                     log.info(
                         "[BW] sent=%.2fMB saved=%.1f%%",
                         sent / 1024 / 1024,
                         (baseline - sent) / baseline * 100,
                     )
+                if baseline_socket is not None:
+                    log.info("[BW_BASE] sent=%.2fMB (full-frame fixed CRF=%d)", base_sent / 1024 / 1024, baseline_crf)
+
+                def _stats(samples):
+                    if not samples:
+                        return {
+                            "avg": 0.0,
+                            "p10": 0.0,
+                            "p50": 0.0,
+                            "p90": 0.0,
+                            "pct_lt_05": 0.0,
+                            "n": 0,
+                        }
+                    vals = np.array([v for _t, v in samples], dtype=np.float32)
+                    return {
+                        "avg": float(vals.mean()),
+                        "p10": float(np.percentile(vals, 10)),
+                        "p50": float(np.percentile(vals, 50)),
+                        "p90": float(np.percentile(vals, 90)),
+                        "pct_lt_05": float(np.mean(vals < 0.5) * 100.0),
+                        "n": int(vals.size),
+                    }
+
+                raw_s = _stats(raw_conf_samples)
+                masked_source = masked_conf_aligned if raw_eval is not None else masked_conf_samples
+                masked_s = _stats(masked_source)
+                keep_ratio = (masked_s["avg"] / raw_s["avg"]) if raw_s["avg"] > 1e-6 else 0.0
+                extra = ""
+                if getattr(args, "measure_raw_bandwidth", False) and raw_bw_samples and masked_bw_samples:
+                    avg_raw_bytes = sum(v for _t, v in raw_bw_samples) / len(raw_bw_samples)
+                    avg_masked_bytes = sum(v for _t, v in masked_bw_samples) / len(masked_bw_samples)
+                    extra = f" | avg_raw_seg={avg_raw_bytes/1024:.1f}KB avg_masked_seg={avg_masked_bytes/1024:.1f}KB"
+
+                log.info(
+                    "[CONF] avg_raw=%.3f p10=%.3f p50=%.3f p90=%.3f lt0.5=%.1f%% | "
+                    "avg_masked=%.3f p10=%.3f p50=%.3f p90=%.3f lt0.5=%.1f%% | "
+                    "keep=%.2f samples(raw=%d masked=%d)%s",
+                    raw_s["avg"], raw_s["p10"], raw_s["p50"], raw_s["p90"], raw_s["pct_lt_05"],
+                    masked_s["avg"], masked_s["p10"], masked_s["p50"], masked_s["p90"], masked_s["pct_lt_05"],
+                    keep_ratio,
+                    raw_s["n"],
+                    masked_s["n"],
+                    extra,
+                )
                 interval_start = time.time()
             frame_index += 1
     finally:
+        raw_eval_stop.set()
+        try:
+            raw_eval_q.put_nowait(None)
+        except Exception:
+            pass
         if segment_items:
             try:
                 active_crf = FIXED_CRF if FIXED_CRF is not None else listener.get_next_crf()
@@ -570,12 +829,22 @@ def main():
         encode_queue.put(None)
         encode_queue.join()
         worker.join(timeout=5.0)
+        if baseline_encode_queue is not None:
+            baseline_encode_queue.put(None)
+            baseline_encode_queue.join()
+        if baseline_worker is not None:
+            baseline_worker.join(timeout=5.0)
         listener.stop()
         cap.release()
         try:
-            client_socket.close()
+            masked_socket.close()
         except Exception:
             pass
+        if baseline_socket is not None:
+            try:
+                baseline_socket.close()
+            except Exception:
+                pass
         cv2.destroyAllWindows()
 
         if recorder is not None:
