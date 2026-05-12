@@ -297,7 +297,7 @@ def main():
     from src.eval.pipeline_counters import PipelineCounters
     from src.eval.recorded_input import RawInputRecorder
     from src.eval.video_metrics import write_summary
-    from src.inference.detection import YoloWorldDetector, parse_classes
+    from src.inference.detection import parse_classes
 
     classes = parse_classes(args.classes) or ["object"]
     cap, input_source, probed_fps = _open_input(args.input, args.width, args.height)
@@ -320,22 +320,6 @@ def main():
     masker = OpticalFlowMasker(motion_threshold=3.0, min_contour_area=1200)
     encoder = SegmentEncoder(width=args.width, height=args.height, fps=fps, gop=args.gop)
 
-    raw_eval = None
-    if getattr(args, "raw_conf_eval", False):
-        try:
-            raw_eval = YoloWorldDetector(
-                model_path=args.model,
-                device="auto",
-                conf_threshold=0.05,
-                iou_threshold=0.45,
-                heatmap_wh=(80, 60),
-            )
-            raw_eval.set_classes(classes)
-            raw_eval.warmup(height=args.height, width=args.width)
-            log.info("raw_conf_eval enabled (stride=%s)", getattr(args, "raw_conf_eval_stride", 15))
-        except Exception as e:
-            raw_eval = None
-            log.warning("raw_conf_eval disabled: %s", e)
     listener = ConfidenceListener(sock=masked_socket, counters=counters)
     baseline_listener = None
     if baseline_socket is not None:
@@ -393,17 +377,12 @@ def main():
     last_crf = {"crf": INITIAL_CRF}
     last_baseline_sent_kb = {"kb": 0.0}
     last_baseline_crf = {"crf": int(getattr(args, "baseline_crf", 20) or 20)}
-    last_raw_boxes = {"boxes": []}
     shared_panel = {"frame": None}
     bw_lock = threading.Lock()
     bw_state = {"sent": 0, "baseline": 0}
     baseline_bw_state = {"sent": 0}
     mode = "Fixed" if FIXED_CRF is not None else "Adaptive"
     crf_transition_count = {"count": 0, "prev": None}
-
-    # Raw YOLO eval runs on a background thread so it doesn't disturb the main pipeline/UI.
-    raw_eval_q = queue.Queue(maxsize=1)
-    raw_eval_stop = threading.Event()
 
     log.info(
         "ready input=%s classes=%s preview=%s artifacts=%s",
@@ -425,7 +404,6 @@ def main():
                 crf = last_crf["crf"]
                 base_sent_kb = last_baseline_sent_kb["kb"]
                 base_crf = last_baseline_crf["crf"]
-                raw_boxes = list(last_raw_boxes["boxes"])
             conf = listener.latest_confidence()
             boxes = listener.latest_boxes()
             base_conf = baseline_listener.latest_confidence() if baseline_listener is not None else None
@@ -442,9 +420,8 @@ def main():
                     base_sent_kb,
                     "Fixed",
                 )
-                # Prefer server-provided baseline boxes (true "raw stream" detections),
-                # and fall back to camera-side raw_eval boxes only when baseline is disabled.
-                boxes_left = base_boxes if base_boxes else raw_boxes
+                # Left panel shows server-side detections from the baseline (full-frame) stream.
+                boxes_left = base_boxes
                 if SHOW_YOLO_BOXES and boxes_left:
                     for (x1, y1, x2, y2, c) in boxes_left:
                         p1 = (int(x1), int(y1))
@@ -489,40 +466,6 @@ def main():
             time.sleep(1.0 / max(PREVIEW_FPS, 1))
 
     threading.Thread(target=composer_loop, daemon=True).start()
-
-    def raw_eval_worker():
-        if raw_eval is None:
-            return
-        while not raw_eval_stop.is_set():
-            try:
-                item = raw_eval_q.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            if item is None:
-                raw_eval_q.task_done()
-                break
-            frame_bgr, ts, masked_conf_snapshot = item
-            try:
-                raw_conf, _hm, raw_dets, _us = raw_eval.infer(frame_bgr)
-                raw_conf_samples.append((ts, float(raw_conf)))
-                masked_conf_aligned.append((ts, float(masked_conf_snapshot)))
-
-                raw_boxes = []
-                try:
-                    person_idx = raw_eval.class_names.index("person")
-                except ValueError:
-                    person_idx = None
-                if person_idx is not None:
-                    for x1, y1, x2, y2, c, cls_idx in raw_dets:
-                        if cls_idx != person_idx:
-                            continue
-                        raw_boxes.append((x1, y1, x2, y2, float(c)))
-                with shared_lock:
-                    last_raw_boxes["boxes"] = raw_boxes
-            except Exception:
-                pass
-            finally:
-                raw_eval_q.task_done()
 
     def encode_and_send(segment_items, crf, baseline_total, transition_count):
         """Encode a completed GOP of masked frames and send it to the server with a
@@ -654,19 +597,16 @@ def main():
 
     interval_start = time.time()
     stats_window_sec = 60.0
-    raw_conf_samples = deque()     # (ts, conf)
+    baseline_conf_samples = deque()  # (ts, conf) from baseline (full-frame) server feedback
     masked_conf_samples = deque()  # (ts, conf)
-    masked_conf_aligned = deque()  # (ts, conf) sampled when raw_conf is sampled
     raw_bw_samples = deque()       # (ts, bytes)
     masked_bw_samples = deque()    # (ts, bytes)
     last_masked_response_count = 0
+    last_baseline_response_count = 0
     segment_items = []
     segment_baseline = 0
     frame_index = 0
     baseline_crf = int(getattr(args, "baseline_crf", 20) or 20)
-
-    if raw_eval is not None:
-        threading.Thread(target=raw_eval_worker, daemon=True).start()
 
     try:
         while True:
@@ -712,34 +652,17 @@ def main():
                 last_masked_response_count = resp_count
                 masked_conf = listener.latest_confidence()
                 masked_conf_samples.append((now, float(masked_conf)))
-            if raw_eval is not None:
-                stride = int(getattr(args, "raw_conf_eval_stride", 15) or 15)
-                if stride <= 0:
-                    stride = 15
-                if frame_index % stride == 0:
-                    # Snapshot masked confidence and enqueue for background raw eval.
-                    masked_snapshot = float(listener.latest_confidence())
-                    try:
-                        raw_eval_q.put_nowait((frame.copy(), now, masked_snapshot))
-                    except queue.Full:
-                        # Prefer newest sample (drop older one).
-                        try:
-                            _ = raw_eval_q.get_nowait()
-                            raw_eval_q.task_done()
-                        except queue.Empty:
-                            pass
-                        try:
-                            raw_eval_q.put_nowait((frame.copy(), now, masked_snapshot))
-                        except queue.Full:
-                            pass
+            if baseline_listener is not None:
+                bcnt = baseline_listener.response_count()
+                if bcnt != last_baseline_response_count:
+                    last_baseline_response_count = bcnt
+                    baseline_conf_samples.append((now, float(baseline_listener.latest_confidence())))
 
             cutoff = now - stats_window_sec
-            while raw_conf_samples and raw_conf_samples[0][0] < cutoff:
-                raw_conf_samples.popleft()
+            while baseline_conf_samples and baseline_conf_samples[0][0] < cutoff:
+                baseline_conf_samples.popleft()
             while masked_conf_samples and masked_conf_samples[0][0] < cutoff:
                 masked_conf_samples.popleft()
-            while masked_conf_aligned and masked_conf_aligned[0][0] < cutoff:
-                masked_conf_aligned.popleft()
 
             with shared_lock:
                 last_raw["frame"] = frame.copy()
@@ -832,9 +755,8 @@ def main():
                         "n": int(vals.size),
                     }
 
-                raw_s = _stats(raw_conf_samples)
-                masked_source = masked_conf_aligned if raw_eval is not None else masked_conf_samples
-                masked_s = _stats(masked_source)
+                raw_s = _stats(baseline_conf_samples)
+                masked_s = _stats(masked_conf_samples)
                 keep_ratio = (masked_s["avg"] / raw_s["avg"]) if raw_s["avg"] > 1e-6 else 0.0
                 extra = ""
                 if getattr(args, "measure_raw_bandwidth", False) and raw_bw_samples and masked_bw_samples:
@@ -856,11 +778,6 @@ def main():
                 interval_start = time.time()
             frame_index += 1
     finally:
-        raw_eval_stop.set()
-        try:
-            raw_eval_q.put_nowait(None)
-        except Exception:
-            pass
         if segment_items:
             try:
                 active_crf = FIXED_CRF if FIXED_CRF is not None else listener.get_next_crf()

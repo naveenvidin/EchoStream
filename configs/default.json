@@ -20,8 +20,6 @@
     "record_input_max_frames": null,
     "response_timeout_sec": 2.0,
     "no_preview": false,
-    "raw_conf_eval": true,
-    "raw_conf_eval_stride": 15,
     "measure_raw_bandwidth": false
   },
   "server_h264": {
