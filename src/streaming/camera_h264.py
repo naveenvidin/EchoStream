@@ -36,7 +36,7 @@ class SegmentEncoder:
     GOP size matches FPS so each segment is exactly one keyframe-aligned group.
     """
 
-    def __init__(self, width: int, height: int, fps: float = 30.0, gop: int = 30):
+    def __init__(self, width: int, height: int, fps: float, gop: int):
         self.width = width
         self.height = height
         # Frames-per-second for the rawvideo input to ffmpeg. This must match the
@@ -227,11 +227,12 @@ def _open_input(spec: str, width: int, height: int):
         cap = cv2.VideoCapture(idx)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        return cap, f"webcam:{idx}", (cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        cap.set(cv2.CAP_PROP_FPS, 15) # force a common FPS for webcams since many don't report it correctly; actual FPS may vary
+        return cap, f"webcam:{idx}", 15
     cap = cv2.VideoCapture(spec)
     if not cap.isOpened():
         raise IOError(f"Cannot open video file: {spec}")
-    return cap, f"file:{spec}", (cap.get(cv2.CAP_PROP_FPS) or 30.0)
+    return cap, f"file:{spec}", cap.get(cv2.CAP_PROP_FPS)
 
 
 def _decode_h264_segment(data: bytes, width: int, height: int) -> list[np.ndarray]:
