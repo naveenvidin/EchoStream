@@ -304,6 +304,8 @@ def main():
 
     masked_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     masked_socket.connect((args.server_ip, args.port))
+    # Handshake: tell the server our real capture FPS so it can size queues / timers.
+    masked_socket.sendall(struct.pack("!f", float(fps)))
 
     baseline_enabled = bool(getattr(args, "baseline_enabled", False))
     baseline_socket = None
@@ -311,6 +313,7 @@ def main():
         baseline_port = int(getattr(args, "baseline_port", args.port))
         baseline_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         baseline_socket.connect((args.server_ip, baseline_port))
+        baseline_socket.sendall(struct.pack("!f", float(fps)))
 
     counters = PipelineCounters(expected_fps=fps)
     masker = OpticalFlowMasker(motion_threshold=3.0, min_contour_area=1200)
@@ -438,14 +441,17 @@ def main():
                     base_sent_kb,
                     "Fixed",
                 )
-                if SHOW_YOLO_BOXES and raw_boxes:
-                    for (x1, y1, x2, y2, c) in raw_boxes:
+                # Prefer server-provided baseline boxes (true "raw stream" detections),
+                # and fall back to camera-side raw_eval boxes only when baseline is disabled.
+                boxes_left = base_boxes if base_boxes else raw_boxes
+                if SHOW_YOLO_BOXES and boxes_left:
+                    for (x1, y1, x2, y2, c) in boxes_left:
                         p1 = (int(x1), int(y1))
                         p2 = (int(x2), int(y2))
                         cv2.rectangle(raw_panel, p1, p2, (255, 255, 0), 2)
                         cv2.putText(
                             raw_panel,
-                            f"raw person {c:.2f}",
+                            f"person {c:.2f}",
                             (p1[0], max(0, p1[1] - 8)),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.5,
