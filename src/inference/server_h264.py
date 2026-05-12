@@ -44,7 +44,7 @@ class H264Decoder:
     BGR frames into an internal queue for downstream consumption.
     """
 
-    def __init__(self, width: int = 640, height: int = 480, fps: float = 30.0):
+    def __init__(self, width: int = 640, height: int = 480, fps: float = 15.0):
         self.width = width
         self.height = height
         self.fps = fps
@@ -87,7 +87,7 @@ class H264Decoder:
                 (self.height, self.width, 3),
             ).copy()
             if self._frame_q.full():
-                log.debug("full, dropping frames in drain, bad")
+                log.info("full, dropping frames in drain, bad")
                 try:
                     self._frame_q.get_nowait()
                 except queue.Empty:
@@ -159,7 +159,8 @@ def inference_loop(decoder, detector, conn, result_q, stop_event):
     while not stop_event.is_set():
         frame = decoder.get_frame()
         if frame is None:
-            log.debug("decoded queue empty, good thing")
+            # commented cause it's expected that the queue will be empty at times and we don't want to spam logs
+            # log.info("decoded queue empty, good thing")
             time.sleep(0.005)
             continue
 
@@ -225,7 +226,7 @@ def inference_loop(decoder, detector, conn, result_q, stop_event):
 
         # Drop stale results if display is falling behind.
         if result_q.full():
-            log.debug("full, dropping frames in inference, bad")
+            log.info("full, dropping frames in inference, bad")
             try:
                 result_q.get_nowait()
             except queue.Empty:
@@ -340,7 +341,10 @@ def main():
         fps_bytes = _recv_exact(conn, 4)
         fps = struct.unpack("!f", fps_bytes)[0]
         frame_duration_ms = int(1000 / fps)
+<<<<<<< HEAD
         # log.info("FPS handshake received: %.2f  frame_duration_ms=%d", fps, frame_duration_ms)
+=======
+>>>>>>> main
         log.info("FPS handshake received: %.2f  frame_duration_ms=%d", fps, frame_duration_ms)
 
         # Decoder queue sized to ~3 seconds at negotiated FPS.
@@ -373,8 +377,8 @@ def main():
                 try:
                     frame, conf, boxes_for_wire = result_q.get(timeout=0.1)
                 except queue.Empty:
-                    log.debug("display queue empty, good thing")
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                    log.info("display queue empty, mid thing")
+                    if cv2.waitKey(500) & 0xFF == ord("q"):
                         break
                     continue
 
@@ -404,9 +408,9 @@ def main():
                 # log.debug(f"Inference+display latency: {elapsed*1000:.1f} ms")
 
                 # Pace display to the negotiated FPS; clamp to at least 1ms for waitKey.
-                wait_time = max(1, frame_duration_ms - int(elapsed * 1000))
-                log.debug(f"Frame duration - Inference: {wait_time:.1f} ms")
-                if cv2.waitKey(wait_time) & 0xFF == ord("q"):
+                # wait_time = max(1, frame_duration_ms - int(elapsed * 1000))
+                # log.info(f"Frame duration - Inference: {wait_time:.1f} ms")
+                if cv2.waitKey(frame_duration_ms) & 0xFF == ord("q"):
                     break
             else:
                 # No display — just wait for inference thread to finish.

@@ -5,6 +5,9 @@
     "max_frames": null,
     "server_ip": "localhost",
     "port": 9999,
+    "baseline_enabled": true,
+    "baseline_port": 9998,
+    "baseline_crf": 20,
     "width": 640,
     "height": 480,
     "classes": "person",
@@ -15,7 +18,8 @@
     "record_input_fps": null,
     "record_input_max_frames": null,
     "response_timeout_sec": 2.0,
-    "no_preview": false
+    "no_preview": false,
+    "measure_raw_bandwidth": false
   },
   "server_h264": {
     "tracker": "kalman",
@@ -30,4 +34,3 @@
     "show_window": true
   }
 }
-
