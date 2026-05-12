@@ -101,20 +101,22 @@ class PipelineCounters:
         self.processing_attempt += 1
 
     # ── Encode ──────────────────────────────────────────────────────
-    def record_encode(self, produced_packet: bool) -> None:
-        self.encode_attempt += 1
+    def record_encode(self, produced_packet: bool, frame_count: int = 1) -> None:
+        frame_count = max(1, int(frame_count))
+        self.encode_attempt += frame_count
         if produced_packet:
-            self._push_ts(self._encode_ts)
+            self._push_ts(self._encode_ts, frame_count)
         else:
-            self.encode_zero_packet += 1
+            self.encode_zero_packet += frame_count
 
     # ── Response ────────────────────────────────────────────────────
-    def record_response_expected(self) -> None:
-        self.response_expected += 1
+    def record_response_expected(self, frame_count: int = 1) -> None:
+        self.response_expected += max(1, int(frame_count))
 
-    def record_response_received(self) -> None:
-        self.response_received += 1
-        self._push_ts(self._response_ts)
+    def record_response_received(self, frame_count: int = 1) -> None:
+        frame_count = max(1, int(frame_count))
+        self.response_received += frame_count
+        self._push_ts(self._response_ts, frame_count)
 
     def record_response_timeout(self) -> None:
         self.response_timeout += 1
@@ -146,9 +148,10 @@ class PipelineCounters:
         self._last_loop_ts = now
 
     # ── Rolling timestamp helpers ───────────────────────────────────
-    def _push_ts(self, buf: Deque[float]) -> None:
+    def _push_ts(self, buf: Deque[float], count: int = 1) -> None:
         now = time.perf_counter()
-        buf.append(now)
+        for _ in range(max(1, int(count))):
+            buf.append(now)
         cutoff = now - OBS_WINDOW_SEC
         while buf and buf[0] < cutoff:
             buf.popleft()
