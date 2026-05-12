@@ -5,3 +5,7 @@ __pycache__/
 .ruff_cache/
 .DS_Store
 /venv
+
+/runs
+*.mov
+*.mp4
