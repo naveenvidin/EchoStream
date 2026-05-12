@@ -42,11 +42,7 @@ class SegmentEncoder:
     GOP size matches FPS so each segment is exactly one keyframe-aligned group.
     """
 
-<<<<<<< HEAD
-    def __init__(self, width: int, height: int, gop: int):
-=======
     def __init__(self, width: int, height: int, fps: float, gop: int):
->>>>>>> main
         self.width = width
         self.height = height
         # Frames-per-second for the rawvideo input to ffmpeg. This must match the
@@ -339,13 +335,7 @@ def main():
 
     classes = parse_classes(args.classes) or ["object"]
     cap, input_source, probed_fps = _open_input(args.input, args.width, args.height)
-<<<<<<< HEAD
-    if probed_fps <= 0:
-        raise ValueError(f"Could not determine FPS of input source '{args.input}'. ")
-    fps = probed_fps
-=======
     fps = float(probed_fps)
->>>>>>> main
 
     masked_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     masked_socket.connect((args.server_ip, args.port))
