@@ -1,7 +1,8 @@
 """Edge inference server using the compare folder's H.264 segment protocol.
 
 Camera -> server:
-    [4-byte big-endian payload length][raw H.264 segment]
+    [4-byte big-endian float: camera FPS]           (handshake, sent once on connect)
+    [4-byte big-endian payload length][raw H.264 segment]  (repeated)
 
 Server -> camera (per decoded frame):
     [float32 metric][uint16 heat_w][uint16 heat_h][uint16 num_boxes]
@@ -13,9 +14,9 @@ with prompted classes supplied on the server CLI.
 
 Threading model:
     Thread 1 - receive_loop:   reads H.264 segments from socket → decoder.push()
-    Thread 2 - _drain_stdout:  reads decoded BGr frames from ffmpeg → frame_q
+    Thread 2 - _drain_stdout:  reads decoded BGR frames from ffmpeg → frame_q
     Thread 3 - inference_loop: frame_q → detector.infer() → send conf → result_q
-    Main thread:               result_q → draw_hud → cv2.imshow → waitKey(1/FPS - inference_time)
+    Main thread:               result_q → draw_hud → cv2.imshow → waitKey
 """
 from __future__ import annotations
 
@@ -34,18 +35,22 @@ import numpy as np
 
 PORT = 9999
 WIDTH, HEIGHT = 640, 480
-FPS = 30
-FRAME_DURATION = 1000 // (FPS/2)  # Aim for ~15 FPS inference to allow some display overhead
 
 log = logging.getLogger("echostream.server")
 
 
 class H264Decoder:
-    def __init__(self, width: int = 640, height: int = 480):
+    """Persistent ffmpeg subprocess that accepts raw H.264 bytes and emits decoded
+    BGR frames into an internal queue for downstream consumption.
+    """
+
+    def __init__(self, width: int = 640, height: int = 480, fps: float = 30.0):
         self.width = width
         self.height = height
+        self.fps = fps
         self._frame_bytes = width * height * 3
-        self._frame_q = queue.Queue(maxsize=FPS * 3)
+        # Queue sized to hold ~3 seconds of frames at the negotiated FPS.
+        self._frame_q = queue.Queue(maxsize=int(fps * 3))
         self._proc = None
         self._reader_thread = None
         self._start()
@@ -70,6 +75,10 @@ class H264Decoder:
         self._reader_thread.start()
 
     def _drain_stdout(self):
+        """Read decoded frames from ffmpeg stdout and push them to the frame queue.
+        If the queue is full, drop the oldest frame to make room so the producer
+        never blocks on a slow consumer.
+        """
         while True:
             raw = self._proc.stdout.read(self._frame_bytes)
             if len(raw) < self._frame_bytes:
@@ -89,6 +98,7 @@ class H264Decoder:
                 pass
 
     def push(self, nal_bytes: bytes):
+        """Write a raw H.264 segment into the ffmpeg decoder's stdin."""
         try:
             self._proc.stdin.write(nal_bytes)
             self._proc.stdin.flush()
@@ -125,7 +135,7 @@ def _recv_exact(conn, size: int):
 
 
 def receive_loop(conn, decoder):
-    """Continuously feed length-prefixed H.264 segments into the decoder."""
+    """Read length-prefixed H.264 segments from the socket and push each into the decoder."""
     while True:
         try:
             header = _recv_exact(conn, 4)
@@ -142,7 +152,10 @@ def receive_loop(conn, decoder):
 
 
 def inference_loop(decoder, detector, conn, result_q, stop_event):
-    """Pull frames from decoder, run inference, send conf, push results for display."""
+    """Pull decoded frames from the decoder, run YOLO inference, send the result
+    back to the camera over the socket, and push annotated frames to result_q for display.
+    Drops frames from result_q when the display thread falls behind.
+    """
     while not stop_event.is_set():
         frame = decoder.get_frame()
         if frame is None:
@@ -210,7 +223,7 @@ def inference_loop(decoder, detector, conn, result_q, stop_event):
             stop_event.set()
             break
 
-        # Drop stale results if display is falling behind
+        # Drop stale results if display is falling behind.
         if result_q.full():
             log.debug("full, dropping frames in inference, bad")
             try:
@@ -253,7 +266,6 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--config", default="configs/default.json",
                    help="JSON config file with defaults.")
-    # A couple of convenience overrides for quick debugging.
     p.add_argument("--port", type=int, default=None,
                    help="Override port from config.")
     p.add_argument("--show-window", action="store_true",
@@ -268,7 +280,6 @@ def _parse_args() -> argparse.Namespace:
         raise SystemExit(f"Missing server_h264 section in config: {cli.config}")
 
     args = argparse.Namespace(**block)
-    # Apply lightweight overrides.
     if cli.port is not None:
         args.port = int(cli.port)
     if cli.show_window:
@@ -286,6 +297,7 @@ def main():
     from src.inference.detection import YoloWorldDetector, parse_classes
     from src.inference.tracking.kalman_tracker import KalmanPersonTracker
 
+    # ----user defined classes and model setup----
     classes = parse_classes(args.classes) or ["object"]
     detector = YoloWorldDetector(
         model_path=args.model,
@@ -304,14 +316,12 @@ def main():
     tracker = None
     if args.tracker == "kalman":
         tracker = KalmanPersonTracker(iou_threshold=0.3, max_age=10)
-    # Attach tracker to the detector so inference_loop can remain a small closure-free thread target.
     detector._echostream_tracker = tracker  # type: ignore[attr-defined]
     try:
         detector.warmup(height=args.height, width=args.width)
     except Exception as e:
         log.warning("detector warmup skipped: %s", e)
 
-    decoder = H264Decoder(width=args.width, height=args.height)
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind(("0.0.0.0", args.port))
@@ -326,8 +336,18 @@ def main():
         conn, addr = server_socket.accept()
         log.info("connection from %s", addr)
 
+        # Receive the camera's actual FPS from the handshake and derive frame duration.
+        fps_bytes = _recv_exact(conn, 4)
+        fps = struct.unpack("!f", fps_bytes)[0]
+        frame_duration_ms = int(1000 / fps)
+        # log.info("FPS handshake received: %.2f  frame_duration_ms=%d", fps, frame_duration_ms)
+        print(f"FPS handshake received: {fps:.2f}  frame_duration_ms={frame_duration_ms}")
+
+        # Decoder queue sized to ~3 seconds at negotiated FPS.
+        decoder = H264Decoder(width=args.width, height=args.height, fps=fps)
+
         stop_event = threading.Event()
-        result_q = queue.Queue(maxsize=FPS * 3)
+        result_q = queue.Queue(maxsize=int(fps * 3))
 
         recv_thread = threading.Thread(
             target=receive_loop, args=(conn, decoder), daemon=True,
@@ -379,14 +399,17 @@ def main():
                     current_fps,
                 )
                 cv2.imshow("Edge Server - YOLO-World", annotated)
+
                 elapsed = time.perf_counter() - infer_start
                 log.debug(f"Inference+display latency: {elapsed*1000:.1f} ms")
-                wait_time = max(1, 66-int(elapsed*1000))  # Aim for ~15 FPS display
+
+                # Pace display to the negotiated FPS; clamp to at least 1ms for waitKey.
+                wait_time = max(1, frame_duration_ms - int(elapsed * 1000))
                 log.debug(f"Frame duration - Inference: {wait_time:.1f} ms")
                 if cv2.waitKey(wait_time) & 0xFF == ord("q"):
                     break
             else:
-                # No display — just wait for inference thread to finish
+                # No display — just wait for inference thread to finish.
                 infer_thread.join(timeout=1.0)
 
     except Exception as e:

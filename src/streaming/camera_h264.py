@@ -21,7 +21,6 @@ from src.optical_flow.motion_masker import OpticalFlowMasker
 SERVER_IP = "localhost"
 PORT = 9999
 FIXED_CRF = None
-FRAMES_PER_SEGMENT = 30
 WIDTH, HEIGHT = 640, 480
 LOG_BANDWIDTH_EVERY_SEC = 60
 INITIAL_CRF = 23
@@ -33,13 +32,21 @@ SHOW_YOLO_BOXES = True
 
 
 class SegmentEncoder:
+    """Encodes a list of raw BGR frames into a single H.264 segment via ffmpeg subprocess.
+    GOP size matches FPS so each segment is exactly one keyframe-aligned group.
+    """
+
     def __init__(self, width: int, height: int, fps: float = 30.0, gop: int = 30):
         self.width = width
         self.height = height
         # Frames-per-second for the rawvideo input to ffmpeg. This must match the
         # real capture cadence; tying it to GOP makes streams appear choppy/slow.
         self.fps = float(fps or 30.0)
-        self.gop = gop
+        self.gop = int(gop or 30)
+        log.info(
+            "SegmentEncoder init width=%d height=%d fps=%.2f gop=%d",
+            self.width, self.height, self.fps, self.gop,
+        )
 
     def _build_cmd(self, crf: int) -> list[str]:
         return [
@@ -60,6 +67,7 @@ class SegmentEncoder:
         ]
 
     def encode(self, frames: list[np.ndarray], crf: int) -> bytes:
+        """Concatenate raw frames, pipe them through ffmpeg, and return the H.264 bytestream."""
         if not frames:
             return b""
         raw = b"".join(f.tobytes() for f in frames)
@@ -73,6 +81,10 @@ class SegmentEncoder:
 
 
 class ConfidenceListener:
+    """Background thread that receives inference results from the server and
+    derives the next CRF value from the reported confidence score.
+    """
+
     def __init__(self, sock: socket.socket, counters=None):
         self.sock = sock
         self.counters = counters
@@ -88,11 +100,19 @@ class ConfidenceListener:
         self._thread.start()
 
     def _conf_to_crf(self, conf: float) -> int:
+        """Map a [0, 1] confidence score to one of five discrete CRF levels.
+        Low confidence (few detections) → low CRF (higher quality).
+        High confidence (many detections) → high CRF (more compression).
+        """
         levels = [23, 28, 33, 38, 43]
         index = min(int(conf * 5), 4)
         return levels[index]
 
     def _listen(self):
+        """Receive inference result packets from the server in a loop.
+        Each packet contains a confidence score, heatmap dimensions, box count,
+        the heatmap bytes, and the box payloads. Updates shared state under lock.
+        """
         while not self._stop.is_set():
             try:
                 header = _recv_exact(self.sock, 10)
@@ -168,6 +188,9 @@ def _recv_exact(sock: socket.socket, size: int) -> bytes:
 
 
 def estimate_baseline_bytes(frame: np.ndarray, crf: int) -> int:
+    """Estimate the size of a raw JPEG encoding of the frame at a given CRF level, 
+    as a rough baseline for bandwidth comparison. Not used for actual encoding.
+    """
     jpeg_q = max(5, min(95, 100 - crf * 2))
     ok, enc = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])
     return len(enc) if ok else 0
@@ -197,6 +220,7 @@ def draw_hud(frame: np.ndarray, label: str, crf: int, conf: float,
 
 
 def _open_input(spec: str, width: int, height: int):
+    """Open a webcam index or video file path and return (cap, label, fps)."""
     is_index = spec.lstrip("-").isdigit()
     if is_index:
         idx = int(spec)
@@ -211,6 +235,9 @@ def _open_input(spec: str, width: int, height: int):
 
 
 def _decode_h264_segment(data: bytes, width: int, height: int) -> list[np.ndarray]:
+    """Decode a raw H.264 bytestream into a list of BGR frames via ffmpeg.
+    Used only for artifact logging, not the live display path.
+    """
     if not data:
         return []
     cmd = [
@@ -328,7 +355,7 @@ def main():
             width=args.width,
             height=args.height,
             fps=fps,
-            gop_size=args.gop,
+            gop_size=fps,
             classes=classes,
             model=args.model,
             device="server",
@@ -379,8 +406,12 @@ def main():
         input_source, classes, "OFF" if args.no_preview else "ON",
         run_dir if artifacts else "OFF",
     )
+    # ----- end of setup, start main loop and background threads -----
 
     def composer_loop():
+        """Render the side-by-side raw+masked preview panel and push it to shared_panel
+        for the main thread to display. Runs at the camera's native FPS.
+        """
         while True:
             with shared_lock:
                 raw = last_raw["frame"]
@@ -487,6 +518,9 @@ def main():
                 raw_eval_q.task_done()
 
     def encode_and_send(segment_items, crf, baseline_total, transition_count):
+        """Encode a completed GOP of masked frames and send it to the server with a
+        4-byte big-endian length header. Optionally logs per-frame artifact data.
+        """
         try:
             frames = [item["masked"] for item in segment_items]
             raw_frames = [item["original"] for item in segment_items]
@@ -582,6 +616,9 @@ def main():
             log.warning("baseline worker error: %s", e)
 
     def network_worker():
+        """Drain the encode_queue in a dedicated thread so encoding never blocks
+        the main capture loop. Sentinel None signals shutdown.
+        """
         while True:
             item = encode_queue.get()
             if item is None:
@@ -626,6 +663,7 @@ def main():
 
     try:
         while True:
+            # -----logging and capture loop-----
             counters.record_loop_tick()
             if args.max_frames is not None and frame_index >= args.max_frames:
                 break
@@ -719,7 +757,8 @@ def main():
                 "flow_ms": flow_ms,
             })
 
-            if len(segment_items) >= args.gop:
+            # Flush a full GOP to the encode queue once we've accumulated enough frames.
+            if len(segment_items) >= fps:
                 try:
                     encode_queue.put_nowait((
                         segment_items,
@@ -864,7 +903,7 @@ def main():
                     width=args.width,
                     height=args.height,
                     fps=fps,
-                    gop_size=args.gop,
+                    gop_size=fps,
                     classes=classes,
                     model=args.model,
                     device="server",
