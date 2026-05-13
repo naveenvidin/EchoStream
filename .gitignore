@@ -10,3 +10,5 @@ __pycache__/
 
 runs/
 configs/camera_pi.json
+
+comments.txt

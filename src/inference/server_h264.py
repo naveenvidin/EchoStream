@@ -259,6 +259,59 @@ def _recv_exact(conn, size: int):
     return b"".join(chunks)
 
 
+def receive_segment(conn):
+    """Read one camera segment from the socket.
+
+    Camera-side header is `!II` = (uint32 segment_id, uint32 payload_length),
+    followed by `payload_length` raw H.264 bytes (one GOP).
+
+    Returns (segment_id, segment_bytes) or None on EOF / connection loss.
+    """
+    header = _recv_exact(conn, 8)
+    if not header:
+        return None
+    segment_id, payload_size = struct.unpack("!II", header)
+    if payload_size <= 0:
+        return int(segment_id), b""
+    segment_data = _recv_exact(conn, int(payload_size))
+    if segment_data is None:
+        return None
+    return int(segment_id), segment_data
+
+
+def _decode_h264_segment(segment_data: bytes, width: int, height: int):
+    """Decode one self-contained H.264 segment (1 GOP) into BGR frames.
+
+    Runs a one-shot ffmpeg subprocess per segment: write the segment to stdin,
+    read raw BGR frames from stdout. Returns [] on empty input or decode error.
+    """
+    if not segment_data:
+        return []
+    frame_bytes = int(width) * int(height) * 3
+    cmd = [
+        "ffmpeg", "-loglevel", "quiet",
+        "-f", "h264", "-i", "pipe:0",
+        "-f", "rawvideo", "-pix_fmt", "bgr24",
+        "pipe:1",
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        )
+        raw, _ = proc.communicate(input=segment_data, timeout=10)
+    except Exception as e:
+        log.debug("segment decode failed: %s", e)
+        return []
+    frames = []
+    for offset in range(0, len(raw) - frame_bytes + 1, frame_bytes):
+        chunk = raw[offset:offset + frame_bytes]
+        frame = np.frombuffer(chunk, dtype=np.uint8).reshape(
+            (int(height), int(width), 3)
+        ).copy()
+        frames.append(frame)
+    return frames
+
+
 def receive_loop(conn, decoder, segment_id_queue):
     """Read (segment_id, length)-prefixed H.264 segments from the socket and
     push each into the decoder. Segment_ids are also pushed onto
@@ -559,9 +612,6 @@ def main():
         frame_duration_ms = int(1000 / fps)
         log.info("FPS handshake received: %.2f  frame_duration_ms=%d", fps, frame_duration_ms)
 
-        # Decoder queue sized to ~3 seconds at negotiated FPS.
-        decoder = H264Decoder(width=args.width, height=args.height, fps=fps)
-
         if getattr(args, "save_artifacts", False):
             artifacts = ServerArtifacts(
                 output_dir=args.output_dir,
@@ -588,26 +638,6 @@ def main():
 
         stop_event = threading.Event()
         result_q = queue.Queue(maxsize=int(fps * 3))
-        # Shared FIFO of incoming segment_ids; receive_loop pushes one per
-        # received segment, inference_loop pops one per group of decoded
-        # frames so per-frame responses carry the correct segment_id.
-        segment_id_queue: queue.Queue = queue.Queue(maxsize=64)
-
-        recv_thread = threading.Thread(
-            target=receive_loop,
-            args=(conn, decoder, segment_id_queue),
-            daemon=True,
-        )
-        infer_thread = threading.Thread(
-            target=inference_loop,
-            args=(
-                decoder, detector, conn, result_q, stop_event, artifacts,
-                segment_id_queue, int(fps),
-            ),
-            daemon=True,
-        )
-        recv_thread.start()
-        infer_thread.start()
 
         fps_counter = 0
         fps_timer = time.time()
