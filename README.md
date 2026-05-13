@@ -36,22 +36,74 @@ If `streamlit` is not recognized, run it through Python:
 python -m streamlit --version
 ```
 
+## Split deployment (Pi camera + GPU server)
+
+The pipeline is split across two machines for real deployment. Two
+config files are provided so each side can be launched without editing
+shared defaults:
+
+- `configs/server_gpu.json` — GPU/inference machine (server side)
+- `configs/camera_pi.json` — Raspberry Pi (camera/edge side)
+
+Edit `configs/camera_pi.json` and set `server_ip` to the GPU server's
+reachable address before launching the Pi. Pipeline logic (detection,
+masking, adaptive encoding, protocol, replay, artifacts, feedback) is
+unchanged — only deployment defaults differ.
+
+**On the GPU server:**
+
+```bash
+python -m src.inference.server_h264 --config configs/server_gpu.json
+```
+
+**On the Raspberry Pi:**
+
+```bash
+python -m src.streaming.camera_h264 --config configs/camera_pi.json
+```
+
+Add `--no-preview` on the Pi if needed (already the default in
+`camera_pi.json`). The legacy single-machine commands below still work
+unchanged via `configs/default.json`.
+
 ## 1. Start the server with YOLO-World
 
 ```powershell
 python -m src.inference.server_h264 --model yolov8s-world.pt --classes "person,wallet,bed" --device auto --show-window
 ```
 
-Server flags:
+Server flags (each overrides the matching key in the JSON config; if
+omitted, the config value is used):
 
 | flag | default | description |
 | --- | --- | --- |
-| `--model` | `yolov8s-world.pt` | YOLO-World checkpoint |
-| `--classes` | `person` | prompted class list, e.g. `person,wallet,bed` |
-| `--device` | `auto` | `auto`, `cuda`, `mps`, or `cpu` |
-| `--port` | `9999` | TCP port |
-| `--conf-threshold` | `0.05` | detector confidence floor |
+| `--config` | `configs/default.json` | JSON config file |
+| `--model` | from config | YOLO-World checkpoint path |
+| `--classes` | from config | prompted class list, e.g. `person,wallet,bed` |
+| `--device` | from config | `auto`, `cuda`, `mps`, or `cpu` |
+| `--conf-threshold` | from config | detector confidence floor |
+| `--nms-iou` | from config | NMS IoU threshold |
+| `--tracker` | from config | `kalman` or `none` |
+| `--host` | `0.0.0.0` | bind host |
+| `--port` | from config | TCP port |
+| `--width` / `--height` | from config | decoded frame size |
 | `--show-window` | off | show server-side detections |
+| `--save-artifacts` | off | write server-side artifacts to `--output-dir` |
+| `--output-dir <dir>` | `runs/server_<ts>` | server artifact directory |
+
+When `--save-artifacts` is on, the server writes:
+
+```text
+<output-dir>/
+  decoded.mp4           decoded H.264 frames as the server received them
+  annotated.mp4         decoded frames with detection boxes drawn
+  server_metrics.csv    per-frame: num_boxes, conf_min/max/mean, infer_ms
+  server_config.json    model, classes, device, host, port, fps, client_addr
+```
+
+Camera-side artifacts (under the camera's own `--output-dir`) are
+unchanged and complement these — both can be saved during the same run
+on their respective machines.
 
 The compare protocol does not send prompted classes from camera to server, so use
 the same `--classes` value on both commands for clean artifact metadata.
@@ -127,8 +179,15 @@ python -m streamlit run src/app/streamlit_eval.py -- --run-dir runs/live_001,run
 The top of the dashboard shows:
 
 1. summary bitrate / savings metrics
-2. Raw vs Masked Bandwidth Usage Over Time
-3. Bitrate vs Detector Confidence Over Time
+2. **Headline tracking — confidence & bandwidth over time** (prominent
+   per-frame charts pulled from `metrics.csv`: detector confidence and
+   actual on-wire kbps, both with smoothing controls; works for live,
+   replay, and single-run analysis)
+3. Raw vs Masked Bandwidth Usage Over Time
+4. Bitrate vs Detector Confidence Over Time
+
+The multi-run comparison view also gains a headline overlay of both
+signals across runs.
 
 Lower sections include detector confidence detail, time-series charts, video
 outputs, latency percentiles, pipeline-health counters, recorded-input metadata,

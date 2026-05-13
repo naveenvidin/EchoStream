@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
 import queue
 import socket
@@ -8,6 +9,7 @@ import struct
 import subprocess
 import threading
 import time
+from collections import deque
 from dataclasses import asdict
 from collections import deque
 from pathlib import Path
@@ -16,6 +18,7 @@ import cv2
 import numpy as np
 
 from src.optical_flow.motion_masker import OpticalFlowMasker
+from src.streaming.pid_controller import CrfPIDController, DiscreteStepCrfController
 
 
 SERVER_IP = "localhost"
@@ -23,14 +26,7 @@ PORT = 9999
 FIXED_CRF = None
 WIDTH, HEIGHT = 640, 480
 LOG_BANDWIDTH_EVERY_SEC = 60
-INITIAL_CRF = 23
-CRF_MIN = 18
-CRF_MAX = 43
-CONF_TARGET = 0.78
-CRF_KP = 8.0
-CRF_KI = 1.0
-CRF_MAX_STEP = 2.0
-CRF_DEADBAND = 0.02
+INITIAL_CRF = 30
 
 log = logging.getLogger("echostream.camera")
 
@@ -91,9 +87,14 @@ class ConfidenceListener:
     derives the next CRF value from the reported confidence score.
     """
 
-    def __init__(self, sock: socket.socket, counters=None):
+    # Cap how many resolved/pending segment_ids we retain so a long-running
+    # session does not leak memory through the per-segment dicts.
+    _SEGMENT_MEMORY = 256
+
+    def __init__(self, sock: socket.socket, pid: CrfPIDController, counters=None):
         self.sock = sock
         self.counters = counters
+        self._pid = pid
         self._current_crf = INITIAL_CRF
         self._next_crf = INITIAL_CRF
         self._crf_value = float(INITIAL_CRF)
@@ -103,37 +104,35 @@ class ConfidenceListener:
         self._latest_boxes = []
         self._latest_segment_id = -1
         self._responses = 0
-        self._pending_segments: dict[int, int] = {}
-        self._segment_confidences: dict[int, float] = {}
+        # Per-segment confidence tracking. _pending_segments holds segments
+        # we have sent but not yet received a response for. _segment_confidences
+        # is the resolved per-segment confidence indexed by segment_id.
+        # _segment_events lets encode_and_send block briefly until the
+        # response for a given segment_id arrives, so the conf logged in the
+        # artifact row is the segment's actual conf and not a stale fallback.
+        self._pending_segments: "dict[int, int]" = {}
+        self._segment_confidences: "dict[int, float]" = {}
+        self._segment_events: "dict[int, threading.Event]" = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._listen, daemon=True)
         self._thread.start()
 
-    def _update_crf(self, conf: float) -> int:
-        error = float(conf) - CONF_TARGET
-        if abs(error) < CRF_DEADBAND:
-            error = 0.0
-        self._crf_integral = max(-8.0, min(8.0, self._crf_integral + error))
-        delta = CRF_KP * error + CRF_KI * self._crf_integral
-        delta = max(-CRF_MAX_STEP, min(CRF_MAX_STEP, delta))
-        self._crf_value = max(CRF_MIN, min(CRF_MAX, self._crf_value + delta))
-        return int(round(self._crf_value))
-
     def _listen(self):
         """Receive inference result packets from the server in a loop.
-        Each packet contains a confidence score, heatmap dimensions, box count,
-        the heatmap bytes, and the box payloads. Updates shared state under lock.
+        Each packet carries (segment_id, conf, heat_w, heat_h, num_boxes) +
+        the heatmap and per-box payloads. The segment_id lets us attribute
+        the response to the segment it came from rather than treating it as
+        an undifferentiated "latest" update.
         """
         while not self._stop.is_set():
             try:
                 header = _recv_exact(self.sock, 14)
-                segment_id, conf, heat_w, heat_h, num_boxes = struct.unpack("!IfHHH", header)
-                if not np.isfinite(conf):
-                    if self.counters is not None:
-                        self.counters.record_invalid_response()
-                    continue
+                segment_id, conf, heat_w, heat_h, num_boxes = struct.unpack(
+                    "!IfHHH", header,
+                )
                 conf = max(0.0, min(1.0, conf))
+                segment_id = int(segment_id)
                 heat_w = int(heat_w)
                 heat_h = int(heat_h)
                 num_boxes = int(num_boxes)
@@ -155,9 +154,16 @@ class ConfidenceListener:
                         x1, y1, x2, y2, c = struct.unpack("!fffff", box_bytes[off:off + 20])
                         boxes.append((x1, y1, x2, y2, c))
 
+                new_crf = self._pid.update(conf)
+                event_to_set = None
                 with self._lock:
-                    frame_count = self._pending_segments.pop(segment_id, None)
-                    new_crf = self._update_crf(conf)
+                    self._pending_segments.pop(segment_id, None)
+                    self._segment_confidences[segment_id] = conf
+                    # Trim old per-segment entries so the dicts can't grow
+                    # unboundedly across a long run.
+                    if len(self._segment_confidences) > self._SEGMENT_MEMORY:
+                        oldest = min(self._segment_confidences)
+                        self._segment_confidences.pop(oldest, None)
                     self._latest_conf = conf
                     self._latest_segment_id = int(segment_id)
                     self._segment_confidences[int(segment_id)] = conf
@@ -165,6 +171,9 @@ class ConfidenceListener:
                     self._latest_heatmap = heatmap
                     self._latest_boxes = boxes
                     self._responses += 1
+                    event_to_set = self._segment_events.pop(segment_id, None)
+                if event_to_set is not None:
+                    event_to_set.set()
                 if self.counters is not None:
                     if frame_count is None:
                         self.counters.record_stale_response()
@@ -177,11 +186,36 @@ class ConfidenceListener:
         self._stop.set()
 
     def expect_segment(self, segment_id: int, frame_count: int) -> None:
-        frame_count = max(1, int(frame_count))
+        """Register that we have sent a segment and are waiting for its
+        per-segment response. Idempotent for repeated calls with the same id.
+        """
         with self._lock:
-            self._pending_segments[int(segment_id)] = frame_count
-        if self.counters is not None:
-            self.counters.record_response_expected(frame_count)
+            self._pending_segments[int(segment_id)] = int(frame_count)
+            self._segment_events.setdefault(int(segment_id), threading.Event())
+
+    def confidence_for_segment(self, segment_id: int,
+                               default: "float | None" = None) -> float:
+        """Return the per-segment confidence resolved for segment_id, or a
+        fallback (default if given, else latest known conf) if the response
+        for this segment has not yet arrived.
+        """
+        with self._lock:
+            fallback = self._latest_conf if default is None else float(default)
+            return float(
+                self._segment_confidences.get(int(segment_id), fallback)
+            )
+
+    def wait_for_segment(self, segment_id: int, timeout: float) -> bool:
+        """Block until the response for `segment_id` has been logged, or
+        until `timeout` seconds elapse. Returns True if the segment was
+        resolved within the timeout, False otherwise. Safe to call after
+        the response has already arrived (returns True immediately).
+        """
+        with self._lock:
+            if int(segment_id) in self._segment_confidences:
+                return True
+            event = self._segment_events.setdefault(int(segment_id), threading.Event())
+        return bool(event.wait(timeout=float(timeout)))
 
     def get_next_crf(self) -> int:
         with self._lock:
@@ -204,11 +238,6 @@ class ConfidenceListener:
         with self._lock:
             return int(self._responses)
 
-    def confidence_for_segment(self, segment_id: int, default: float | None = None) -> float:
-        with self._lock:
-            fallback = self._latest_conf if default is None else default
-            return float(self._segment_confidences.get(int(segment_id), fallback))
-
 
 def _recv_exact(sock: socket.socket, size: int) -> bytes:
     chunks, received = [], 0
@@ -222,8 +251,17 @@ def _recv_exact(sock: socket.socket, size: int) -> bytes:
 
 
 def estimate_baseline_bytes(frame: np.ndarray, crf: int) -> int:
-    """Estimate the size of a raw JPEG encoding of the frame at a given CRF level, 
-    as a rough baseline for bandwidth comparison. Not used for actual encoding.
+    """Per-frame JPEG size estimator used as the denominator of the
+    `[BW] saved=...%` log line.
+
+    NOTE: this is *not* the same baseline as `[BW_BASE]`. This function
+    encodes each raw frame as a standalone JPEG (no inter-frame
+    compression) at a quality derived from the current PID-chosen CRF, so
+    the denominator both lacks H.264's GOP gains and tracks the
+    controller. The result is much larger than the actual H.264 baseline
+    stream's bytes, which is why `[BW] saved` reads higher than the true
+    EchoStream-vs-baseline ratio. Use `[BW_DELTA]` for the apples-to-
+    apples comparison when the baseline stream is enabled.
     """
     jpeg_q = max(5, min(95, 100 - crf * 2))
     ok, enc = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])
@@ -302,7 +340,43 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--config", default="configs/default.json",
                    help="JSON config file with defaults.")
-    # Convenience overrides (optional).
+    # Each override defaults to None / False so the JSON config's value is
+    # only displaced when the flag is actually passed on the command line.
+    p.add_argument("--input", default=None,
+                   help="Override input source (webcam index or video path).")
+    p.add_argument("--server-ip", dest="server_ip", default=None,
+                   help="Override GPU server IP / hostname.")
+    p.add_argument("--port", type=int, default=None,
+                   help="Override server port.")
+    p.add_argument("--width", type=int, default=None,
+                   help="Override capture/encode width.")
+    p.add_argument("--height", type=int, default=None,
+                   help="Override capture/encode height.")
+    p.add_argument("--classes", default=None,
+                   help="Override prompted classes, e.g. 'person,wallet,bed'.")
+    p.add_argument("--model", default=None,
+                   help="Override model path recorded in session_config.json.")
+    p.add_argument("--save-artifacts", dest="save_artifacts",
+                   action="store_true",
+                   help="Override save_artifacts=true (write run dir).")
+    p.add_argument("--output-dir", dest="output_dir", default=None,
+                   help="Override output directory for artifacts.")
+    p.add_argument("--record-input", dest="record_input", default=None,
+                   help="Override raw input recording path (webcam only).")
+    p.add_argument("--record-input-fps", dest="record_input_fps",
+                   type=float, default=None,
+                   help="Override raw input recording fps.")
+    p.add_argument("--record-input-max-frames", dest="record_input_max_frames",
+                   type=int, default=None,
+                   help="Override raw input max frames.")
+    p.add_argument("--loop-video", dest="loop_video",
+                   action="store_true",
+                   help="Override loop_video=true for file inputs.")
+    p.add_argument("--max-frames", dest="max_frames", type=int, default=None,
+                   help="Override max_frames cap.")
+    p.add_argument("--response-timeout-sec", dest="response_timeout_sec",
+                   type=float, default=None,
+                   help="Override response timeout (seconds).")
     p.add_argument("--no-preview", action="store_true",
                    help="Override no_preview=true (headless).")
 
@@ -315,6 +389,29 @@ def _parse_args() -> argparse.Namespace:
         raise SystemExit(f"Missing camera_h264 section in config: {cli.config}")
 
     args = argparse.Namespace(**block)
+
+    overrides = {
+        "input": cli.input,
+        "server_ip": cli.server_ip,
+        "port": cli.port,
+        "width": cli.width,
+        "height": cli.height,
+        "classes": cli.classes,
+        "model": cli.model,
+        "output_dir": cli.output_dir,
+        "record_input": cli.record_input,
+        "record_input_fps": cli.record_input_fps,
+        "record_input_max_frames": cli.record_input_max_frames,
+        "max_frames": cli.max_frames,
+        "response_timeout_sec": cli.response_timeout_sec,
+    }
+    for key, value in overrides.items():
+        if value is not None:
+            setattr(args, key, value)
+    if cli.save_artifacts:
+        args.save_artifacts = True
+    if cli.loop_video:
+        args.loop_video = True
     if cli.no_preview:
         args.no_preview = True
     return args
@@ -337,11 +434,18 @@ def main():
     cap, input_source, probed_fps = _open_input(args.input, args.width, args.height)
     fps = float(probed_fps)
 
+    # The "masked" socket carries the adaptive ROI-masked stream; this is the
+    # original (and only) connection in the previous pipeline.
     masked_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     masked_socket.connect((args.server_ip, args.port))
-    # Handshake: tell the server our real capture FPS so it can size queues / timers.
-    masked_socket.sendall(struct.pack("!f", fps))
 
+    # Send the camera's actual FPS to the server immediately after connecting,
+    # so the server can set its own FRAME_DURATION without relying on a hardcoded constant.
+    masked_socket.sendall(struct.pack("!f", fps))
+    log.info("sent FPS handshake to server: %.2f", fps)
+
+    # Optional parallel "baseline" stream: a full-frame fixed-CRF copy sent to a
+    # second server instance for A/B comparison against the masked stream.
     baseline_enabled = bool(getattr(args, "baseline_enabled", False))
     baseline_socket = None
     if baseline_enabled:
@@ -350,14 +454,62 @@ def main():
         baseline_socket.connect((args.server_ip, baseline_port))
         baseline_socket.sendall(struct.pack("!f", fps))
 
+    # -----set up shared state and background threads-----
     counters = PipelineCounters(expected_fps=fps)
     masker = OpticalFlowMasker(motion_threshold=3.0, min_contour_area=1200)
     encoder = SegmentEncoder(width=args.width, height=args.height, fps=fps, gop=int(fps))
+    controller_type = str(getattr(args, "controller_type", "pid")).lower()
 
-    listener = ConfidenceListener(sock=masked_socket, counters=counters)
+    def _build_controller():
+        if controller_type == "discrete":
+            return DiscreteStepCrfController(initial_crf=INITIAL_CRF)
+        return CrfPIDController(
+            target=float(getattr(args, "pid_target", 0.78)),
+            kp=float(getattr(args, "pid_kp", 8.0)),
+            ki=float(getattr(args, "pid_ki", 1.0)),
+            kd=float(getattr(args, "pid_kd", 0.0)),
+            max_step=float(getattr(args, "pid_max_step", 2.0)),
+            deadband=float(getattr(args, "pid_deadband", 0.02)),
+            crf_min=int(getattr(args, "pid_crf_min", 18)),
+            crf_max=int(getattr(args, "pid_crf_max", 43)),
+            initial_crf=INITIAL_CRF,
+        )
+
+    pid = _build_controller()
+    if isinstance(pid, CrfPIDController):
+        log.info(
+            "PID adaptive CRF: target=%.2f kp=%.2f ki=%.2f kd=%.2f "
+            "step=%.2f deadband=%.3f range=[%d,%d]",
+            pid.target, pid.kp, pid.ki, pid.kd,
+            pid.max_step, pid.deadband, pid.crf_min, pid.crf_max,
+        )
+        controller_meta = {
+            "type": "pid",
+            "initial_crf": INITIAL_CRF,
+            "target": pid.target,
+            "kp": pid.kp,
+            "ki": pid.ki,
+            "kd": pid.kd,
+            "max_step": pid.max_step,
+            "deadband": pid.deadband,
+            "crf_min": pid.crf_min,
+            "crf_max": pid.crf_max,
+        }
+    else:
+        log.info(
+            "Discrete-step CRF controller: levels=%s",
+            getattr(pid, "LEVELS", []),
+        )
+        controller_meta = {
+            "type": "discrete",
+            "initial_crf": INITIAL_CRF,
+            "levels": list(getattr(pid, "LEVELS", [])),
+        }
+
+    listener = ConfidenceListener(sock=masked_socket, pid=pid, counters=counters)
     baseline_listener = None
     if baseline_socket is not None:
-        baseline_listener = ConfidenceListener(sock=baseline_socket, counters=None)
+        baseline_listener = ConfidenceListener(sock=baseline_socket, pid=_build_controller(), counters=None)
 
     run_dir = args.output_dir
     if args.save_artifacts and not run_dir:
@@ -385,7 +537,50 @@ def main():
             max_frames=args.max_frames,
             loop_video=args.loop_video,
             seed=0,
+            controller=controller_meta,
         ))
+
+    # Sidecar CSV for the baseline (full-frame fixed-CRF) stream. One row per
+    # encoded segment. Lives in the same run dir as metrics.csv so Streamlit can
+    # overlay them on a common time axis. Only opened when both artifact saving
+    # and the baseline stream are on; otherwise the writer stays None.
+    baseline_csv_file = None
+    baseline_csv_writer = None
+    baseline_csv_lock = threading.Lock()
+    baseline_csv_state = {"t0": None, "segment_index": 0, "cum_bytes": 0}
+    if artifacts is not None and baseline_socket is not None:
+        baseline_csv_path = artifacts.run_dir / "baseline_metrics.csv"
+        try:
+            baseline_csv_file = open(baseline_csv_path, "w", newline="")
+            baseline_csv_writer = csv.DictWriter(
+                baseline_csv_file,
+                fieldnames=[
+                    "segment_index", "wall_time_sec", "timestamp_sec",
+                    "num_frames", "crf", "encoded_bytes",
+                    "cumulative_encoded_bytes", "instantaneous_bitrate_bps",
+                    "conf_metric",
+                ],
+            )
+            baseline_csv_writer.writeheader()
+            baseline_csv_file.flush()
+            log.info("baseline metrics → %s", baseline_csv_path)
+        except Exception as e:
+            log.warning("baseline_metrics.csv open failed: %s", e)
+            baseline_csv_file = None
+            baseline_csv_writer = None
+
+    # Optional: ship metrics.csv + baseline_metrics.csv + session_config.json
+    # to a server-side mirror process so the server-hosted Streamlit can read
+    # the comparison while the run is in progress. One-way TCP, best-effort.
+    mirror_sender = None
+    if artifacts is not None and bool(getattr(args, "mirror_enabled", False)):
+        from src.eval.metrics_mirror import MetricsMirrorSender
+        mirror_sender = MetricsMirrorSender(
+            run_dir=artifacts.run_dir,
+            host=str(getattr(args, "mirror_host", "localhost") or "localhost"),
+            port=int(getattr(args, "mirror_port", 9997) or 9997),
+        )
+        mirror_sender.start()
 
     recorder = None
     recorded_input_meta = None
@@ -444,33 +639,35 @@ def main():
             base_boxes = baseline_listener.latest_boxes() if baseline_listener is not None else []
             if raw is not None:
                 raw_panel = raw.copy()
-                # Left panel uses baseline server feedback when available.
-                draw_hud(
-                    raw_panel,
-                    "Baseline - full frame stream",
-                    base_crf,
-                    float(base_conf) if base_conf is not None else 0.0,
-                    1.0,
-                    base_sent_kb,
-                    "Fixed",
-                )
-                # Left panel shows server-side detections from the baseline (full-frame) stream.
-                boxes_left = base_boxes
-                if SHOW_YOLO_BOXES and boxes_left:
-                    for (x1, y1, x2, y2, c) in boxes_left:
-                        p1 = (int(x1), int(y1))
-                        p2 = (int(x2), int(y2))
-                        cv2.rectangle(raw_panel, p1, p2, (255, 255, 0), 2)
-                        cv2.putText(
-                            raw_panel,
-                            f"person {c:.2f}",
-                            (p1[0], max(0, p1[1] - 8)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5,
-                            (255, 255, 0),
-                            1,
+                if baseline_listener is not None:
+                    # Left panel uses baseline server feedback when available.
+                    draw_hud(
+                        raw_panel,
+                        "Baseline - full frame stream",
+                        base_crf,
+                        float(base_conf) if base_conf is not None else 0.0,
+                        1.0,
+                        base_sent_kb,
+                        "Fixed",
+                    )
+                    if SHOW_YOLO_BOXES and base_boxes:
+                        for (x1, y1, x2, y2, c) in base_boxes:
+                            p1 = (int(x1), int(y1))
+                            p2 = (int(x2), int(y2))
+                            cv2.rectangle(raw_panel, p1, p2, (255, 255, 0), 2)
+                            cv2.putText(
+                                raw_panel,
+                                f"person {c:.2f}",
+                                (p1[0], max(0, p1[1] - 8)),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.5,
+                                (255, 255, 0),
+                                1,
                                 cv2.LINE_AA,
                             )
+                else:
+                    draw_hud(raw_panel, "Source - raw camera feed",
+                             crf, conf, roi, sent_kb, mode)
                 if masked is not None:
                     masked_panel = masked.copy()
                     draw_hud(masked_panel, "Masked - ROI prepared stream",
@@ -501,8 +698,11 @@ def main():
     threading.Thread(target=composer_loop, daemon=True).start()
 
     def encode_and_send(segment_id, segment_items, crf, baseline_total, transition_count):
-        """Encode a completed GOP of masked frames and send it to the server with a
-        segment id and 4-byte big-endian length header. Optionally logs per-frame artifact data.
+        """Encode a completed GOP of masked frames and send it to the server
+        with an 8-byte big-endian header (segment_id, payload_length). The
+        segment_id is echoed back per-frame in the server's response so
+        confidence values can be attributed to the segment that produced
+        them rather than treated as undifferentiated "latest" updates.
         """
         try:
             frames = [item["masked"] for item in segment_items]
@@ -547,6 +747,11 @@ def main():
             per_frame_bytes = len(data) // max(len(segment_items), 1)
             remainder = len(data) - per_frame_bytes * len(segment_items)
             per_frame_encode_ms = encode_ms_total / max(len(segment_items), 1)
+            # Block briefly so the segment's actual response has time to land
+            # before we record its conf. Cap the wait so a stalled/dropped
+            # response can't stall the encode worker.
+            listener.wait_for_segment(segment_id, timeout=0.5)
+            segment_conf = listener.confidence_for_segment(segment_id)
             for idx, item in enumerate(segment_items):
                 encoded_bytes = per_frame_bytes + (1 if idx < remainder else 0)
                 decoded = decoded_frames[idx] if idx < len(decoded_frames) else None
@@ -559,7 +764,7 @@ def main():
                     sequence_id=segment_id,
                     input_source=input_source,
                     roi_ratio=item["roi_ratio"],
-                    conf_metric=listener.confidence_for_segment(segment_id),
+                    conf_metric=segment_conf,
                     crf=crf,
                     encoded_bytes=encoded_bytes,
                     num_detections=0,
@@ -585,6 +790,11 @@ def main():
             log.warning("worker error: %s", e)
 
     def encode_and_send_baseline(segment_id, segment_items, crf):
+        """Encode the unmodified frames at a fixed CRF and ship them to the
+        parallel baseline server. Same 8-byte (segment_id, length) header
+        the masked stream uses so a single server binary handles both. No-op
+        when baseline mode is disabled.
+        """
         if baseline_socket is None:
             return
         try:
@@ -601,6 +811,41 @@ def main():
                 last_baseline_crf["crf"] = crf
             with bw_lock:
                 baseline_bw_state["sent"] += len(data)
+
+            # Sidecar per-segment row for Streamlit A/B overlay. Wait briefly
+            # so the baseline conf logged here is for THIS segment, not the
+            # previous one.
+            if baseline_csv_writer is not None:
+                wall_now = time.time()
+                seg_dur = max(len(segment_items), 1) / max(float(fps), 1.0)
+                inst_bps = (len(data) * 8.0) / seg_dur if seg_dur > 0 else 0.0
+                seg_conf = 0.0
+                if baseline_listener is not None:
+                    baseline_listener.wait_for_segment(segment_id, timeout=0.5)
+                    seg_conf = float(
+                        baseline_listener.confidence_for_segment(segment_id)
+                    )
+                with baseline_csv_lock:
+                    if baseline_csv_state["t0"] is None:
+                        baseline_csv_state["t0"] = wall_now
+                    baseline_csv_state["cum_bytes"] += len(data)
+                    baseline_csv_state["segment_index"] += 1
+                    row = {
+                        "segment_index": baseline_csv_state["segment_index"],
+                        "wall_time_sec": round(wall_now, 6),
+                        "timestamp_sec": round(wall_now - baseline_csv_state["t0"], 6),
+                        "num_frames": len(segment_items),
+                        "crf": int(crf),
+                        "encoded_bytes": len(data),
+                        "cumulative_encoded_bytes": baseline_csv_state["cum_bytes"],
+                        "instantaneous_bitrate_bps": round(inst_bps, 3),
+                        "conf_metric": seg_conf,
+                    }
+                    try:
+                        baseline_csv_writer.writerow(row)
+                        baseline_csv_file.flush()
+                    except Exception as e:
+                        log.debug("baseline csv write failed: %s", e)
         except Exception as e:
             log.warning("baseline worker error: %s", e)
 
@@ -637,16 +882,15 @@ def main():
     interval_start = time.time()
     stats_window_sec = 60.0
     baseline_conf_samples = deque()  # (ts, conf) from baseline (full-frame) server feedback
-    masked_conf_samples = deque()  # (ts, conf)
-    raw_bw_samples = deque()       # (ts, bytes)
-    masked_bw_samples = deque()    # (ts, bytes)
+    masked_conf_samples = deque()    # (ts, conf)
+    raw_bw_samples = deque()         # (ts, bytes)
+    masked_bw_samples = deque()      # (ts, bytes)
     last_masked_response_count = 0
     last_baseline_response_count = 0
     segment_items = []
     segment_baseline = 0
     next_segment_id = 0
-    current_segment_id = None
-    current_segment_crf = None
+    current_segment_id: "int | None" = None
     frame_index = 0
     baseline_crf = int(getattr(args, "baseline_crf", 20) or 20)
 
@@ -688,12 +932,13 @@ def main():
             masked_frame, roi_ratio = masker.apply(frame, object_score_map=object_score_map)
             flow_ms = (time.perf_counter() - t_flow) * 1000.0
 
+            # Sample per-frame confidence from both streams whenever the server
+            # delivers a new response. Used by the periodic [CONF] log.
             now = time.time()
             resp_count = listener.response_count()
             if resp_count != last_masked_response_count:
                 last_masked_response_count = resp_count
-                masked_conf = listener.latest_confidence()
-                masked_conf_samples.append((now, float(masked_conf)))
+                masked_conf_samples.append((now, float(listener.latest_confidence())))
             if baseline_listener is not None:
                 bcnt = baseline_listener.response_count()
                 if bcnt != last_baseline_response_count:
@@ -721,7 +966,11 @@ def main():
                     crf_transition_count["count"] += 1
                     crf_transition_count["prev"] = current_segment_crf
 
-            segment_baseline += estimate_baseline_bytes(frame, current_segment_crf)
+            if not segment_items:
+                current_segment_id = next_segment_id
+                next_segment_id += 1
+
+            segment_baseline += estimate_baseline_bytes(frame, active_crf)
             segment_items.append({
                 "frame_index": frame_index,
                 "original": frame.copy(),
@@ -752,7 +1001,6 @@ def main():
                 segment_items = []
                 segment_baseline = 0
                 current_segment_id = None
-                current_segment_crf = None
 
             if not args.no_preview:
                 with shared_lock:
@@ -775,23 +1023,38 @@ def main():
                     while raw_bw_samples and raw_bw_samples[0][0] < cutoff:
                         raw_bw_samples.popleft()
                 if baseline > 0:
+                    # Denominator here is the synthetic per-frame JPEG
+                    # estimator (estimate_baseline_bytes), NOT the parallel
+                    # baseline H.264 stream. See [BW_DELTA] below for the
+                    # apples-to-apples comparison against [BW_BASE].
                     log.info(
-                        "[BW] sent=%.2fMB saved=%.1f%%",
+                        "[BW] sent=%.2fMB saved=%.1f%% vs per-frame JPEG estimator",
                         sent / 1024 / 1024,
                         (baseline - sent) / baseline * 100,
                     )
                 if baseline_socket is not None:
-                    log.info("[BW_BASE] sent=%.2fMB (full-frame fixed CRF=%d)", base_sent / 1024 / 1024, baseline_crf)
+                    log.info(
+                        "[BW_BASE] sent=%.2fMB (full-frame fixed CRF=%d)",
+                        base_sent / 1024 / 1024, baseline_crf,
+                    )
+                    # Apples-to-apples: actual EchoStream bytes vs the actual
+                    # full-frame fixed-CRF baseline stream's bytes over the
+                    # same window. This is the correct number for any
+                    # "EchoStream saves X% vs baseline" claim.
+                    if base_sent > 0:
+                        log.info(
+                            "[BW_DELTA] EchoStream=%.2fMB vs Baseline=%.2fMB "
+                            "→ saved=%.1f%% vs baseline H.264",
+                            sent / 1024 / 1024,
+                            base_sent / 1024 / 1024,
+                            (base_sent - sent) / base_sent * 100,
+                        )
 
                 def _stats(samples):
                     if not samples:
                         return {
-                            "avg": 0.0,
-                            "p10": 0.0,
-                            "p50": 0.0,
-                            "p90": 0.0,
-                            "pct_lt_05": 0.0,
-                            "n": 0,
+                            "avg": 0.0, "p10": 0.0, "p50": 0.0, "p90": 0.0,
+                            "pct_lt_05": 0.0, "n": 0,
                         }
                     vals = np.array([v for _t, v in samples], dtype=np.float32)
                     return {
@@ -828,15 +1091,24 @@ def main():
     finally:
         if segment_items:
             try:
+                active_crf = FIXED_CRF if FIXED_CRF is not None else listener.get_next_crf()
+                trailing_segment_id = (
+                    current_segment_id
+                    if current_segment_id is not None
+                    else next_segment_id
+                )
                 encode_queue.put((
-                    current_segment_id,
+                    trailing_segment_id,
                     segment_items,
                     current_segment_crf,
                     segment_baseline,
                     crf_transition_count["count"],
                 ), timeout=2.0)
                 if baseline_encode_queue is not None:
-                    baseline_encode_queue.put((current_segment_id, segment_items, baseline_crf), timeout=2.0)
+                    baseline_encode_queue.put(
+                        (trailing_segment_id, segment_items, baseline_crf),
+                        timeout=2.0,
+                    )
             except Exception:
                 pass
         encode_queue.put(None)
@@ -858,6 +1130,17 @@ def main():
         if baseline_socket is not None:
             try:
                 baseline_socket.close()
+            except Exception:
+                pass
+        if baseline_csv_file is not None:
+            try:
+                baseline_csv_file.flush()
+                baseline_csv_file.close()
+            except Exception:
+                pass
+        if mirror_sender is not None:
+            try:
+                mirror_sender.stop()
             except Exception:
                 pass
         cv2.destroyAllWindows()
@@ -889,6 +1172,7 @@ def main():
                     seed=0,
                     recorded_input=recorded_input_meta,
                     pipeline_health=counters.summary_dict(),
+                    controller=controller_meta,
                 ))
                 summary = write_summary(str(artifacts.run_dir))
                 log.info(

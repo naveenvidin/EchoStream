@@ -161,7 +161,10 @@ class SessionArtifacts:
             self._writers[name] = w
 
         csv_path = self.run_dir / "metrics.csv"
-        self._csv_file = open(csv_path, "w", newline="")
+        # buffering=1 → line buffering, so a file tailer (e.g. the artifact
+        # mirror) sees each completed row land on disk immediately instead of
+        # waiting for a 4KB block to fill. No effect on producer overhead.
+        self._csv_file = open(csv_path, "w", newline="", buffering=1)
         self._csv_writer = csv.DictWriter(self._csv_file, fieldnames=METRIC_COLUMNS)
         self._csv_writer.writeheader()
 
@@ -269,10 +272,15 @@ class SessionArtifacts:
         if self._start_t is None:
             self._start_t = now
             self._prev_t = now
-        dt = max(now - (self._prev_t or now), 1e-6)
         ts = now - self._start_t
         self._cum_bytes += int(encoded_bytes or 0)
-        inst_bps = (int(encoded_bytes or 0) * 8) / dt
+        # Per-frame on-wire rate: bytes-per-frame * 8 * fps. Using wall-clock
+        # dt between log_frame() calls would be wrong here — all frames in a
+        # GOP are logged back-to-back after the segment encodes, so that dt
+        # collapses to ~1 ms and inflates inst_bps by 30-80×. Using fps
+        # matches the baseline writer (camera_h264.py) which divides segment
+        # bytes by num_frames/fps for the same quantity.
+        inst_bps = float(encoded_bytes or 0) * 8.0 * float(self.fps)
         avg_bps = (self._cum_bytes * 8) / max(ts, 1e-6)
         self._prev_t = now
 

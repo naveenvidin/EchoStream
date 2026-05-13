@@ -28,8 +28,34 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+
+
+def _trim_warmup(df, skip_first: int):
+    """Drop the first `skip_first` rows; protects bandwidth charts from the
+    startup outlier caused by the first metrics.csv row using dt ≈ 1e-6 s.
+    See artifacts.py: the very first frame computes inst_bps with a near-zero
+    dt, producing a multi-million-kbps spike that crushes the chart's y-axis.
+    """
+    if df is None or skip_first <= 0 or len(df) == 0:
+        return df
+    n = min(int(skip_first), max(0, len(df) - 1))
+    return df.iloc[n:].reset_index(drop=True) if n else df
+
+
+def _robust_ymax(series, percentile: float = 99.0, pad: float = 1.10) -> Optional[float]:
+    """Percentile-clipped upper bound for a numeric series."""
+    try:
+        import numpy as np
+        vals = np.asarray(series, dtype=float)
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            return None
+        return float(np.percentile(vals, percentile) * pad)
+    except Exception:
+        return None
 
 
 def _parse_run_dirs() -> List[str]:
@@ -339,6 +365,466 @@ def _render_raw_masked_bandwidth_section(st, run_dir: Path, summary: dict,
         st.line_chart(chart_df)
 
 
+def _render_top_confidence_over_time(st, df, summary, key_prefix: str = ""):
+    """Prominent, top-of-page confidence-over-time chart.
+
+    Pulls `conf_metric` from metrics.csv (the actual confidence score
+    returned by the server for each segment) and plots it against time.
+    Same data as the deeper confidence panel below — duplicated up top so
+    the two headline tracking signals (confidence + bandwidth) are
+    visible without scrolling, for both single-run and replay analysis.
+    """
+    if "conf_metric" not in df.columns:
+        st.info("conf_metric column missing from metrics.csv — "
+                "confidence-over-time chart unavailable.")
+        return
+
+    st.subheader("Confidence score over time")
+    st.caption(
+        "Per-frame detector confidence reported by the server. Higher is "
+        "better. For live runs this tracks how detection quality moves "
+        "as the scene changes; for replay runs it shows how the adaptive "
+        "encoder's CRF choices affected detection on the same input."
+    )
+
+    conf_summary = summary.get("confidence_summary") or {}
+    cs1, cs2, cs3, cs4 = st.columns(4)
+    cs1.metric("Mean", f"{float(conf_summary.get('mean') or 0):.3f}")
+    cs2.metric("Median", f"{float(conf_summary.get('median') or 0):.3f}")
+    cs3.metric(
+        "p5 / p95",
+        f"{float(conf_summary.get('p5') or 0):.3f} / "
+        f"{float(conf_summary.get('p95') or 0):.3f}",
+    )
+    cs4.metric("Frames < 0.5",
+               _fmt_pct(conf_summary.get("frac_below_0_5")))
+
+    cc1, cc2 = st.columns([1, 3])
+    smooth_win = cc1.slider(
+        "Smoothing (frames)",
+        min_value=1, max_value=101, value=15, step=2,
+        key=f"top_conf_smooth_{key_prefix}",
+    )
+    show_raw = cc2.checkbox(
+        "Show raw curve alongside smoothed",
+        value=True, key=f"top_conf_show_raw_{key_prefix}",
+    )
+
+    x_col = _pick_x_axis(df, prefer="timestamp_sec")
+    if x_col is None:
+        st.warning("No timestamp_sec or frame_index column to plot against.")
+        return
+
+    import pandas as pd
+    series = {
+        "smoothed": (
+            df["conf_metric"].astype(float)
+              .rolling(window=int(smooth_win), min_periods=1, center=True)
+              .mean()
+              .values
+        ),
+    }
+    if show_raw:
+        series["raw"] = df["conf_metric"].astype(float).values
+    chart_df = pd.DataFrame(series, index=df[x_col].values)
+    chart_df.index.name = (
+        "Time (s)" if x_col in ("timestamp_sec", "source_timestamp_sec")
+        else "Frame index"
+    )
+    st.line_chart(chart_df)
+
+
+def _render_top_bandwidth_over_time(st, df, summary, key_prefix: str = ""):
+    """Prominent, top-of-page bandwidth-consumption-over-time chart.
+
+    Uses `instantaneous_bitrate_bps` and `cumulative_encoded_bytes`
+    from metrics.csv — the actual on-wire bandwidth produced by the
+    adaptive encoder, not just raw vs masked video sizes. This is the
+    quantity the camera/server link actually consumes, so it is the
+    headline cost signal for live and replay runs alike.
+    """
+    if "instantaneous_bitrate_bps" not in df.columns:
+        st.info("instantaneous_bitrate_bps column missing from "
+                "metrics.csv — bandwidth-over-time chart unavailable.")
+        return
+
+    st.subheader("Bandwidth consumption over time")
+    st.caption(
+        "Actual on-wire bandwidth produced by the adaptive encoder, "
+        "in kbps. Peaks line up with high-information segments; troughs "
+        "line up with idle / heavily masked segments. The cumulative "
+        "panel shows total bytes sent so far — useful for sanity-checking "
+        "long replays against expected data budgets."
+    )
+
+    bm1, bm2, bm3, bm4 = st.columns(4)
+    bm1.metric("Live avg bitrate",
+               _fmt_bitrate(summary.get("adaptive_avg_bitrate_bps_live")))
+    bm2.metric("Live total bytes",
+               _fmt_bytes(summary.get("adaptive_encoded_bytes_live")))
+    bm3.metric("Adaptive vs original savings",
+               f"{(summary.get('adaptive_vs_original_savings_pct') or 0):.1f}%")
+    bm4.metric("Frames",
+               int(summary.get("frames_processed") or 0))
+
+    cc1, cc2, cc3 = st.columns([1, 1, 2])
+    smooth_win = cc1.slider(
+        "Smoothing (frames)",
+        min_value=1, max_value=101, value=15, step=2,
+        key=f"top_bw_smooth_{key_prefix}",
+    )
+    skip_first = cc2.slider(
+        "Skip first samples",
+        min_value=0, max_value=20, value=1, step=1,
+        key=f"top_bw_skip_{key_prefix}",
+        help="Drops the warmup row(s); the first metrics.csv row has an "
+             "inflated bitrate from a ~µs dt at startup.",
+    )
+    show_raw = cc3.checkbox(
+        "Show raw curve alongside smoothed",
+        value=False, key=f"top_bw_show_raw_{key_prefix}",
+        help="Per-frame bitrate is noisy — smoothed view is usually clearer.",
+    )
+
+    df_plot = _trim_warmup(df, skip_first)
+    x_col = _pick_x_axis(df_plot, prefer="timestamp_sec")
+    if x_col is None or len(df_plot) == 0:
+        st.warning("No timestamp_sec or frame_index column to plot against.")
+        return
+
+    import pandas as pd
+    bitrate_kbps = df_plot["instantaneous_bitrate_bps"].astype(float) / 1000.0
+    smoothed = bitrate_kbps.rolling(
+        window=int(smooth_win), min_periods=1, center=True
+    ).mean()
+    series = {"smoothed (kbps)": smoothed.values}
+    if show_raw:
+        series["raw (kbps)"] = bitrate_kbps.values
+    chart_df = pd.DataFrame(series, index=df_plot[x_col].values)
+    chart_df.index.name = (
+        "Time (s)" if x_col in ("timestamp_sec", "source_timestamp_sec")
+        else "Frame index"
+    )
+    st.line_chart(chart_df)
+
+    if "cumulative_encoded_bytes" in df.columns:
+        cum_kb = (
+            df["cumulative_encoded_bytes"].astype(float) / 1024.0
+        )
+        cum_df = pd.DataFrame(
+            {"cumulative (KB)": cum_kb.values},
+            index=df[x_col].values,
+        )
+        cum_df.index.name = chart_df.index.name
+        st.markdown("**Cumulative bandwidth consumed**")
+        st.line_chart(cum_df)
+
+
+def _render_baseline_vs_echostream(st, run_dir: Path, df, key_prefix: str = ""):
+    """Headline A/B chart: baseline (raw + fixed CRF) vs EchoStream (masked + adaptive).
+
+    Reads `baseline_metrics.csv` if present (written by camera_h264.py when
+    baseline_enabled and --save-artifacts are both on). Overlays its bandwidth
+    and confidence curves against the masked side from `metrics.csv`. The
+    intended takeaway: confidence drops only a little, bandwidth savings are
+    much larger.
+
+    Warmup rows are trimmed and the y-axis is percentile-clipped because the
+    first row of metrics.csv reports inst_bps divided by dt ≈ 1e-6 s
+    (artifact of the producer's per-row dt) — a multi-million-kbps point
+    that would otherwise flatten the chart.
+    """
+    baseline_csv = run_dir / "baseline_metrics.csv"
+    if not baseline_csv.exists() or df is None or len(df) == 0:
+        return
+
+    import pandas as pd
+    try:
+        bdf = pd.read_csv(baseline_csv)
+    except Exception as e:
+        st.warning(f"baseline_metrics.csv unreadable: {e}")
+        return
+    if len(bdf) == 0:
+        return
+
+    st.markdown("### Baseline vs EchoStream — headline A/B")
+    st.caption(
+        "Same source frames sent through two parallel paths: **baseline** "
+        "(unmasked + fixed CRF) and **EchoStream** (motion-masked + adaptive CRF). "
+        "Look for: confidence curves close together, bandwidth curves far apart."
+    )
+
+    # ── display controls ────────────────────────────────────────────────────
+    cc1, cc2, cc3, cc4 = st.columns([1, 1, 1, 1])
+    smooth = cc1.slider(
+        "Smoothing (samples)",
+        min_value=1, max_value=101, value=15, step=2,
+        key=f"ab_smooth_{key_prefix}",
+    )
+    skip_first = cc2.slider(
+        "Skip first samples",
+        min_value=0, max_value=20, value=1, step=1,
+        key=f"ab_skip_{key_prefix}",
+        help="Drops the warmup row(s); the first metrics.csv row has an "
+             "inflated bitrate from a ~µs dt at startup.",
+    )
+    auto_refresh = cc3.checkbox(
+        "Live (auto-refresh)", value=False,
+        key=f"ab_live_{key_prefix}",
+        help="Re-read CSVs every few seconds for a near-real-time view.",
+    )
+    refresh_sec = cc4.slider(
+        "Refresh interval (s)",
+        min_value=1, max_value=30, value=3, step=1,
+        key=f"ab_refresh_{key_prefix}",
+        disabled=not auto_refresh,
+    )
+
+    df_plot = _trim_warmup(df, skip_first)
+    bdf_plot = _trim_warmup(bdf, skip_first)
+
+    # EchoStream's `instantaneous_bitrate_bps` column was historically inflated
+    # ~30-80× because artifacts.py divided by wall-clock dt between log_frame()
+    # calls (which collapses to ~1 ms inside a GOP burst) instead of the
+    # per-frame period 1/fps. Recompute kbps here from encoded_bytes * 8 * fps
+    # so legacy CSVs render correctly. New CSVs (post-fix) report the same
+    # value in their inst_bps column, so this stays consistent either way.
+    def _echo_kbps(frame):
+        if (
+            "encoded_bytes" in frame.columns
+            and "fps" in frame.columns
+            and len(frame)
+        ):
+            return (
+                frame["encoded_bytes"].astype(float)
+                * 8.0
+                * frame["fps"].astype(float)
+                / 1000.0
+            )
+        if "instantaneous_bitrate_bps" in frame.columns:
+            return frame["instantaneous_bitrate_bps"].astype(float) / 1000.0
+        return None
+
+    es_kbps_series = _echo_kbps(df_plot)
+    # Baseline writer in camera_h264.py is already correct (segment-duration
+    # based), so its column is trustworthy.
+    bl_kbps_series = (
+        bdf_plot["instantaneous_bitrate_bps"].astype(float) / 1000.0
+        if "instantaneous_bitrate_bps" in bdf_plot.columns and len(bdf_plot) else None
+    )
+
+    # ── headline summary cards (computed on trimmed data) ────────────────────
+    es_mean_conf = (
+        float(df_plot["conf_metric"].mean())
+        if "conf_metric" in df_plot.columns and len(df_plot) else 0.0
+    )
+    bl_mean_conf = (
+        float(bdf_plot["conf_metric"].mean())
+        if "conf_metric" in bdf_plot.columns and len(bdf_plot) else 0.0
+    )
+    es_avg_bps = (
+        float(es_kbps_series.mean()) * 1000.0
+        if es_kbps_series is not None and len(es_kbps_series) else 0.0
+    )
+    bl_avg_bps = (
+        float(bl_kbps_series.mean()) * 1000.0
+        if bl_kbps_series is not None and len(bl_kbps_series) else 0.0
+    )
+    conf_delta_pct = (
+        (es_mean_conf - bl_mean_conf) / bl_mean_conf * 100.0
+        if bl_mean_conf > 1e-6 else 0.0
+    )
+    bw_saved_pct = (
+        (bl_avg_bps - es_avg_bps) / bl_avg_bps * 100.0
+        if bl_avg_bps > 1e-6 else 0.0
+    )
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Baseline mean conf", f"{bl_mean_conf:.3f}")
+    m2.metric("EchoStream mean conf", f"{es_mean_conf:.3f}",
+              f"{conf_delta_pct:+.1f}%")
+    m3.metric("Baseline avg bandwidth", _fmt_bitrate(bl_avg_bps))
+    m4.metric("EchoStream avg bandwidth", _fmt_bitrate(es_avg_bps),
+              f"saved {bw_saved_pct:.1f}%")
+
+    # ── combined dual-axis chart: bandwidth (left) + confidence (right) ──────
+    have_bw = (
+        es_kbps_series is not None
+        and bl_kbps_series is not None
+        and "timestamp_sec" in df_plot.columns
+        and "timestamp_sec" in bdf_plot.columns
+        and len(df_plot) and len(bdf_plot)
+    )
+    have_conf = (
+        "conf_metric" in df_plot.columns
+        and "timestamp_sec" in df_plot.columns
+        and "conf_metric" in bdf_plot.columns
+        and "timestamp_sec" in bdf_plot.columns
+        and len(df_plot) and len(bdf_plot)
+    )
+
+    if have_bw or have_conf:
+        st.markdown(
+            "**Bandwidth vs Confidence over time — baseline vs EchoStream**"
+        )
+        st.caption(
+            "Left axis = bandwidth (kbps), right axis = confidence (0–1). "
+            "Each of the four lines has its own color (see legend). "
+            "Win condition: bandwidth lines far apart, confidence lines close together."
+        )
+
+        # Color mapping per series. Distinct hues for all four lines so the
+        # chart is readable at a glance without relying on line styling.
+        COLORS = {
+            "Baseline bandwidth":   "#d62728",  # red
+            "EchoStream bandwidth": "#1f77b4",  # blue
+            "Baseline confidence":  "#ff7f0e",  # orange
+            "EchoStream confidence":"#2ca02c",  # green
+        }
+        SERIES_DOMAIN = list(COLORS.keys())
+        SERIES_RANGE = [COLORS[s] for s in SERIES_DOMAIN]
+
+        # Bandwidth: use field name `kbps` (own field, never shared with conf
+        # — this is what makes `resolve_scale(y='independent')` actually keep
+        # the two y-axes separate; sharing a field name silently merges the
+        # scales and collapses confidence onto the bandwidth axis).
+        bw_df = None
+        bw_ymax = None
+        if have_bw:
+            es_bw = pd.DataFrame({
+                "time_sec": df_plot["timestamp_sec"].astype(float).values,
+                "kbps": es_kbps_series.values,
+                "series": "EchoStream bandwidth",
+            })
+            bl_bw = pd.DataFrame({
+                "time_sec": bdf_plot["timestamp_sec"].astype(float).values,
+                "kbps": bl_kbps_series.values,
+                "series": "Baseline bandwidth",
+            })
+            if smooth > 1:
+                es_bw["kbps"] = (
+                    es_bw["kbps"].rolling(window=int(smooth), min_periods=1, center=True).mean()
+                )
+                bl_bw["kbps"] = (
+                    bl_bw["kbps"].rolling(window=int(smooth), min_periods=1, center=True).mean()
+                )
+            bw_df = pd.concat([bl_bw, es_bw], ignore_index=True)
+            bw_ymax = _robust_ymax(bw_df["kbps"], percentile=99.0, pad=1.10)
+
+        # Confidence: own field name `conf`, kept distinct from `kbps`.
+        conf_df = None
+        if have_conf:
+            es_c = pd.DataFrame({
+                "time_sec": df_plot["timestamp_sec"].astype(float).values,
+                "conf": df_plot["conf_metric"].astype(float).values,
+                "series": "EchoStream confidence",
+            })
+            bl_c = pd.DataFrame({
+                "time_sec": bdf_plot["timestamp_sec"].astype(float).values,
+                "conf": bdf_plot["conf_metric"].astype(float).values,
+                "series": "Baseline confidence",
+            })
+            if smooth > 1:
+                es_c["conf"] = (
+                    es_c["conf"].rolling(window=int(smooth), min_periods=1, center=True).mean()
+                )
+                bl_c["conf"] = (
+                    bl_c["conf"].rolling(window=int(smooth), min_periods=1, center=True).mean()
+                )
+            conf_df = pd.concat([bl_c, es_c], ignore_index=True)
+
+        try:
+            import altair as alt
+            # One shared color scale across both layers — Altair will merge
+            # them into a single legend with all four series.
+            series_color = alt.Color(
+                "series:N", title="Series",
+                scale=alt.Scale(domain=SERIES_DOMAIN, range=SERIES_RANGE),
+                legend=alt.Legend(orient="top", columns=4),
+            )
+
+            layers = []
+            if bw_df is not None:
+                bw_scale = (
+                    alt.Scale(zero=True) if bw_ymax is None
+                    else alt.Scale(domain=[0, bw_ymax], clamp=True)
+                )
+                bw_layer = (
+                    alt.Chart(bw_df)
+                    .mark_line(strokeWidth=2)
+                    .encode(
+                        x=alt.X("time_sec:Q", title="Time (s)"),
+                        y=alt.Y(
+                            "kbps:Q",
+                            title="Bandwidth (kbps)",
+                            scale=bw_scale,
+                            axis=alt.Axis(orient="left"),
+                        ),
+                        color=series_color,
+                        tooltip=[
+                            alt.Tooltip("series:N", title="Series"),
+                            alt.Tooltip("time_sec:Q", title="Time (s)", format=".2f"),
+                            alt.Tooltip("kbps:Q", title="kbps", format=".1f"),
+                        ],
+                    )
+                )
+                layers.append(bw_layer)
+
+            if conf_df is not None:
+                conf_layer = (
+                    alt.Chart(conf_df)
+                    .mark_line(strokeWidth=2)
+                    .encode(
+                        x=alt.X("time_sec:Q", title="Time (s)"),
+                        y=alt.Y(
+                            "conf:Q",
+                            title="Confidence score (0–1)",
+                            scale=alt.Scale(domain=[0, 1]),
+                            axis=alt.Axis(orient="right"),
+                        ),
+                        color=series_color,
+                        tooltip=[
+                            alt.Tooltip("series:N", title="Series"),
+                            alt.Tooltip("time_sec:Q", title="Time (s)", format=".2f"),
+                            alt.Tooltip("conf:Q", title="Confidence", format=".3f"),
+                        ],
+                    )
+                )
+                layers.append(conf_layer)
+
+            if layers:
+                chart = (
+                    alt.layer(*layers)
+                    .resolve_scale(y="independent")
+                    .properties(height=380)
+                )
+                st.altair_chart(chart, use_container_width=True)
+        except Exception:
+            # Fallback path (Altair missing). Keep two simple charts so the
+            # panel never blanks out in low-dep environments.
+            if bw_df is not None:
+                st.markdown("_Bandwidth (kbps)_")
+                st.line_chart(
+                    bw_df.pivot_table(index="time_sec", columns="series", values="kbps")
+                         .sort_index()
+                )
+            if conf_df is not None:
+                st.markdown("_Confidence (0–1)_")
+                st.line_chart(
+                    conf_df.pivot_table(index="time_sec", columns="series", values="conf")
+                          .sort_index()
+                )
+
+    if auto_refresh:
+        time.sleep(float(refresh_sec))
+        try:
+            st.rerun()
+        except Exception:
+            try:
+                st.experimental_rerun()
+            except Exception:
+                pass
+
+
 def _render_confidence_section(st, df, summary, key_prefix: str = ""):
     """Confidence-over-time panel with raw/smoothed curves, threshold
     overlay, summary stats, and adjacent compression-context charts."""
@@ -617,6 +1103,22 @@ def _render_single_run(st, run_dir: Path):
     c12.metric("CRF transitions",
                summary.get("crf_transition_count") or 0,
                f"{summary.get('restart_count') or 0} encoder restarts")
+
+    # Headline tracking signals: confidence + actual bandwidth over time.
+    # Promoted to the top so live and replay runs both surface these
+    # without scrolling. Detailed panels remain further down.
+    #
+    # When a `baseline_metrics.csv` is present in the run dir (camera was run
+    # with baseline_enabled + --save-artifacts), the baseline-vs-EchoStream
+    # A/B overlay is shown first; it answers the headline question directly.
+    _render_baseline_vs_echostream(
+        st, run_dir, df, key_prefix=f"ab_{run_dir.name}")
+    if df is not None and len(df) > 0:
+        st.markdown("### Headline tracking — confidence & bandwidth over time")
+        _render_top_confidence_over_time(
+            st, df, summary, key_prefix=f"top_{run_dir.name}")
+        _render_top_bandwidth_over_time(
+            st, df, summary, key_prefix=f"top_{run_dir.name}")
 
     _render_raw_masked_bandwidth_section(
         st, run_dir, summary, key_prefix=run_dir.name)
@@ -963,6 +1465,32 @@ def _render_comparison(st, run_dirs: List[Path]):
             bw_frames[rd.name] = df["instantaneous_bitrate_bps"]
         if "roi_ratio" in df.columns:
             roi_frames[rd.name] = df["roi_ratio"]
+
+    if conf_frames or bw_frames:
+        st.markdown("### Headline tracking — confidence & bandwidth over time")
+        st.caption(
+            "Cross-run overlay of the two headline signals. Use this to "
+            "compare how each run's confidence and on-wire bandwidth "
+            "evolve on the same replay input or across live sessions."
+        )
+
+    if bw_frames:
+        import pandas as pd
+        st.markdown("**Bandwidth consumption over time (kbps, overlay)**")
+        bw_df_kbps = pd.DataFrame(
+            {name: s.astype(float) / 1000.0 for name, s in bw_frames.items()}
+        )
+        oc1, _ = st.columns([1, 3])
+        bw_smooth = oc1.slider(
+            "Bandwidth smoothing (frames)",
+            min_value=1, max_value=101, value=15, step=2,
+            key="cmp_bw_smooth",
+        )
+        if bw_smooth > 1:
+            bw_df_kbps = bw_df_kbps.rolling(
+                window=int(bw_smooth), min_periods=1, center=True
+            ).mean()
+        st.line_chart(bw_df_kbps)
 
     if conf_frames:
         import pandas as pd
