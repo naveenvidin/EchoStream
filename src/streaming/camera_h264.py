@@ -23,14 +23,15 @@ PORT = 9999
 FIXED_CRF = None
 WIDTH, HEIGHT = 640, 480
 LOG_BANDWIDTH_EVERY_SEC = 60
-INITIAL_CRF = 23
-CRF_MIN = 18
-CRF_MAX = 43
-CONF_TARGET = 0.78
-CRF_KP = 8.0
-CRF_KI = 1.0
-CRF_MAX_STEP = 2.0
-CRF_DEADBAND = 0.02
+INITIAL_CRF = 30
+CRF_MIN = 27
+CRF_MAX = 47
+CONF_TARGET = 0.8
+CONF_MARGIN = 0.03
+CONF_EMA_ALPHA = 0.3
+CRF_UP_STEP = 1
+CRF_DOWN_STEP = 2
+CRF_PROBE_INTERVAL = 3
 
 log = logging.getLogger("echostream.camera")
 
@@ -68,6 +69,7 @@ class SegmentEncoder:
             "-crf", str(crf),
             "-g", str(self.gop),
             "-sc_threshold", "0",
+            "-x264-params", "aq-mode=2:aq-strength=1.5",
             "-f", "h264",
             "pipe:1",
         ]
@@ -97,7 +99,8 @@ class ConfidenceListener:
         self._current_crf = INITIAL_CRF
         self._next_crf = INITIAL_CRF
         self._crf_value = float(INITIAL_CRF)
-        self._crf_integral = 0.0
+        self._smoothed_conf = None
+        self._probe_wait = 0
         self._latest_conf = 0.5
         self._latest_heatmap = None
         self._latest_boxes = []
@@ -111,13 +114,27 @@ class ConfidenceListener:
         self._thread.start()
 
     def _update_crf(self, conf: float) -> int:
-        error = float(conf) - CONF_TARGET
-        if abs(error) < CRF_DEADBAND:
-            error = 0.0
-        self._crf_integral = max(-8.0, min(8.0, self._crf_integral + error))
-        delta = CRF_KP * error + CRF_KI * self._crf_integral
-        delta = max(-CRF_MAX_STEP, min(CRF_MAX_STEP, delta))
-        self._crf_value = max(CRF_MIN, min(CRF_MAX, self._crf_value + delta))
+        if self._smoothed_conf is None:
+            self._smoothed_conf = float(conf)
+        else:
+            self._smoothed_conf = (
+                CONF_EMA_ALPHA * float(conf)
+                + (1.0 - CONF_EMA_ALPHA) * self._smoothed_conf
+            )
+
+        if self._smoothed_conf < CONF_TARGET - CONF_MARGIN:
+            self._crf_value -= CRF_DOWN_STEP
+            self._probe_wait = 0
+        elif self._smoothed_conf > CONF_TARGET + CONF_MARGIN:
+            self._crf_value += CRF_UP_STEP
+            self._probe_wait = 0
+        else:
+            self._probe_wait += 1
+            if self._probe_wait >= CRF_PROBE_INTERVAL:
+                self._crf_value += CRF_UP_STEP
+                self._probe_wait = 0
+
+        self._crf_value = max(CRF_MIN, min(CRF_MAX, self._crf_value))
         return int(round(self._crf_value))
 
     def _listen(self):
