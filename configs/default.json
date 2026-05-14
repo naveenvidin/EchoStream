@@ -7,7 +7,7 @@
     "port": 9999,
     "baseline_enabled": true,
     "baseline_port": 9998,
-    "baseline_crf": 20,
+    "baseline_crf": 23,
     "width": 640,
     "height": 480,
     "classes": "person",
