@@ -22,11 +22,11 @@ SERVER_IP = "localhost"
 PORT = 9999
 FIXED_CRF = None
 WIDTH, HEIGHT = 640, 480
-LOG_BANDWIDTH_EVERY_SEC = 60
+LOG_BANDWIDTH_EVERY_SEC = 10.0
 INITIAL_CRF = 30
-CRF_MIN = 27
-CRF_MAX = 47
-CONF_TARGET = 0.8
+CRF_MIN = 25
+CRF_MAX = 45
+CONF_TARGET = 0.65
 CONF_MARGIN = 0.03
 CONF_EMA_ALPHA = 0.3
 CRF_UP_STEP = 1
@@ -69,7 +69,7 @@ class SegmentEncoder:
             "-crf", str(crf),
             "-g", str(self.gop),
             "-sc_threshold", "0",
-            "-x264-params", "aq-mode=2:aq-strength=1.5",
+            "-x264-params", "aq-mode=2:aq-strength=1.3",
             "-f", "h264",
             "pipe:1",
         ]
@@ -353,6 +353,7 @@ def main():
     classes = parse_classes(args.classes) or ["object"]
     cap, input_source, probed_fps = _open_input(args.input, args.width, args.height)
     fps = float(probed_fps)
+    gop = fps//3 if fps >= 3 else 1 # SO IMPORTANT LIKE SO IMPORTANT
 
     masked_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     masked_socket.connect((args.server_ip, args.port))
@@ -369,7 +370,7 @@ def main():
 
     counters = PipelineCounters(expected_fps=fps)
     masker = OpticalFlowMasker(motion_threshold=3.0, min_contour_area=1200)
-    encoder = SegmentEncoder(width=args.width, height=args.height, fps=fps, gop=int(fps))
+    encoder = SegmentEncoder(width=args.width, height=args.height, fps=fps, gop=int(gop))
 
     listener = ConfidenceListener(sock=masked_socket, counters=counters)
     baseline_listener = None
@@ -394,7 +395,7 @@ def main():
             width=args.width,
             height=args.height,
             fps=fps,
-            gop_size=fps,
+            gop_size=gop,
             classes=classes,
             model=args.model,
             device="server",
@@ -521,6 +522,7 @@ def main():
         """Encode a completed GOP of masked frames and send it to the server with a
         segment id and 4-byte big-endian length header. Optionally logs per-frame artifact data.
         """
+        print(f"regular encoding at crf: {crf}")
         try:
             frames = [item["masked"] for item in segment_items]
             raw_frames = [item["original"] for item in segment_items]
@@ -604,6 +606,7 @@ def main():
     def encode_and_send_baseline(segment_id, segment_items, crf):
         if baseline_socket is None:
             return
+        print(f"baseline encoding at crf: {crf}")
         try:
             frames = [item["original"] for item in segment_items]
             data = encoder.encode(frames, crf)
@@ -750,7 +753,7 @@ def main():
             })
 
             # Flush a full GOP to the encode queue once we've accumulated enough frames.
-            if len(segment_items) >= fps:
+            if len(segment_items) >= gop: # CONFIG: fps = 1 second segments, gop = half-second 
                 try:
                     encode_queue.put_nowait((
                         current_segment_id,
@@ -896,7 +899,7 @@ def main():
                     width=args.width,
                     height=args.height,
                     fps=fps,
-                    gop_size=fps,
+                    gop_size=gop,
                     classes=classes,
                     model=args.model,
                     device="server",
