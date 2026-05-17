@@ -505,7 +505,11 @@ def _render_top_bandwidth_over_time(st, df, summary, key_prefix: str = ""):
         "Time (s)" if x_col in ("timestamp_sec", "source_timestamp_sec")
         else "Frame index"
     )
-    st.line_chart(chart_df)
+    left_col, right_col = st.columns([2, 1])
+    with left_col:
+        st.line_chart(chart_df)
+    with right_col:
+        st.empty()
 
     if "cumulative_encoded_bytes" in df.columns:
         cum_kb = (
@@ -547,7 +551,7 @@ def _render_baseline_vs_echostream(st, run_dir: Path, df, key_prefix: str = ""):
     if len(bdf) == 0:
         return
 
-    st.markdown("### Baseline vs EchoStream — headline A/B")
+    st.markdown("### Baseline vs StreamSense — headline A/B")
     st.caption(
         "Same source frames sent through two parallel paths: **baseline** "
         "(unmasked + fixed CRF) and **EchoStream** (motion-masked + adaptive CRF). "
@@ -583,6 +587,26 @@ def _render_baseline_vs_echostream(st, run_dir: Path, df, key_prefix: str = ""):
     df_plot = _trim_warmup(df, skip_first)
     bdf_plot = _trim_warmup(bdf, skip_first)
 
+    # Defensive: coerce every numeric column the A/B panel touches so a
+    # malformed cell (e.g. "False" landing in encoded_bytes from a column-
+    # misaligned row written by concurrent CSV writers) becomes NaN rather
+    # than crashing .mean() / .astype(float) downstream. Clean runs are
+    # unaffected — pd.to_numeric on already-numeric columns is a no-op.
+    _AB_NUMERIC_COLS = (
+        "conf_metric", "encoded_bytes", "fps", "instantaneous_bitrate_bps",
+        "cumulative_encoded_bytes", "crf", "timestamp_sec",
+    )
+    def _coerce_numeric(frame):
+        if frame is None or len(frame) == 0:
+            return frame
+        frame = frame.copy()
+        for col in _AB_NUMERIC_COLS:
+            if col in frame.columns:
+                frame[col] = pd.to_numeric(frame[col], errors="coerce")
+        return frame
+    df_plot = _coerce_numeric(df_plot)
+    bdf_plot = _coerce_numeric(bdf_plot)
+
     # EchoStream's `instantaneous_bitrate_bps` column was historically inflated
     # ~30-80× because artifacts.py divided by wall-clock dt between log_frame()
     # calls (which collapses to ~1 ms inside a GOP burst) instead of the
@@ -596,20 +620,20 @@ def _render_baseline_vs_echostream(st, run_dir: Path, df, key_prefix: str = ""):
             and len(frame)
         ):
             return (
-                frame["encoded_bytes"].astype(float)
+                pd.to_numeric(frame["encoded_bytes"], errors="coerce")
                 * 8.0
-                * frame["fps"].astype(float)
+                * pd.to_numeric(frame["fps"], errors="coerce")
                 / 1000.0
             )
         if "instantaneous_bitrate_bps" in frame.columns:
-            return frame["instantaneous_bitrate_bps"].astype(float) / 1000.0
+            return pd.to_numeric(frame["instantaneous_bitrate_bps"], errors="coerce") / 1000.0
         return None
 
     es_kbps_series = _echo_kbps(df_plot)
     # Baseline writer in camera_h264.py is already correct (segment-duration
     # based), so its column is trustworthy.
     bl_kbps_series = (
-        bdf_plot["instantaneous_bitrate_bps"].astype(float) / 1000.0
+        pd.to_numeric(bdf_plot["instantaneous_bitrate_bps"], errors="coerce") / 1000.0
         if "instantaneous_bitrate_bps" in bdf_plot.columns and len(bdf_plot) else None
     )
 
@@ -640,10 +664,10 @@ def _render_baseline_vs_echostream(st, run_dir: Path, df, key_prefix: str = ""):
     )
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Baseline mean conf", f"{bl_mean_conf:.3f}")
-    m2.metric("EchoStream mean conf", f"{es_mean_conf:.3f}",
+    m2.metric("StreamSense mean conf", f"{es_mean_conf:.3f}",
               f"{conf_delta_pct:+.1f}%")
     m3.metric("Baseline avg bandwidth", _fmt_bitrate(bl_avg_bps))
-    m4.metric("EchoStream avg bandwidth", _fmt_bitrate(es_avg_bps),
+    m4.metric("StreamSense avg bandwidth", _fmt_bitrate(es_avg_bps),
               f"saved {bw_saved_pct:.1f}%")
 
     # ── combined dual-axis chart: bandwidth (left) + confidence (right) ──────
@@ -664,7 +688,7 @@ def _render_baseline_vs_echostream(st, run_dir: Path, df, key_prefix: str = ""):
 
     if have_bw or have_conf:
         st.markdown(
-            "**Bandwidth vs Confidence over time — baseline vs EchoStream**"
+            "**Bandwidth vs Confidence over time — baseline vs StreamSense**"
         )
         st.caption(
             "Left axis = bandwidth (kbps), right axis = confidence (0–1). "
@@ -675,10 +699,10 @@ def _render_baseline_vs_echostream(st, run_dir: Path, df, key_prefix: str = ""):
         # Color mapping per series. Distinct hues for all four lines so the
         # chart is readable at a glance without relying on line styling.
         COLORS = {
-            "Baseline bandwidth":   "#d62728",  # red
-            "EchoStream bandwidth": "#1f77b4",  # blue
-            "Baseline confidence":  "#ff7f0e",  # orange
-            "EchoStream confidence":"#2ca02c",  # green
+            "Baseline bandwidth":    "#d62728",  # red
+            "StreamSense bandwidth": "#1f77b4",  # blue
+            "Baseline confidence":   "#ff7f0e",  # orange
+            "StreamSense confidence":"#2ca02c",  # green
         }
         SERIES_DOMAIN = list(COLORS.keys())
         SERIES_RANGE = [COLORS[s] for s in SERIES_DOMAIN]
@@ -693,7 +717,7 @@ def _render_baseline_vs_echostream(st, run_dir: Path, df, key_prefix: str = ""):
             es_bw = pd.DataFrame({
                 "time_sec": df_plot["timestamp_sec"].astype(float).values,
                 "kbps": es_kbps_series.values,
-                "series": "EchoStream bandwidth",
+                "series": "StreamSense bandwidth",
             })
             bl_bw = pd.DataFrame({
                 "time_sec": bdf_plot["timestamp_sec"].astype(float).values,
@@ -716,7 +740,7 @@ def _render_baseline_vs_echostream(st, run_dir: Path, df, key_prefix: str = ""):
             es_c = pd.DataFrame({
                 "time_sec": df_plot["timestamp_sec"].astype(float).values,
                 "conf": df_plot["conf_metric"].astype(float).values,
-                "series": "EchoStream confidence",
+                "series": "StreamSense confidence",
             })
             bl_c = pd.DataFrame({
                 "time_sec": bdf_plot["timestamp_sec"].astype(float).values,
@@ -812,6 +836,57 @@ def _render_baseline_vs_echostream(st, run_dir: Path, df, key_prefix: str = ""):
                 st.line_chart(
                     conf_df.pivot_table(index="time_sec", columns="series", values="conf")
                           .sort_index()
+                )
+
+        # Bandwidth-only companion chart (single y-axis, no confidence).
+        # Reuses the same kbps series as the combined chart so values match;
+        # relabels "Baseline bandwidth" → "Raw bandwidth" for poster framing.
+        if bw_df is not None and len(bw_df):
+            st.markdown("**Raw vs StreamSense bandwidth over time**")
+            st.caption(
+                "Bandwidth only — no confidence overlay. Wider gap between "
+                "the two lines = more bandwidth saved by StreamSense."
+            )
+            bw_only_df = bw_df.copy()
+            bw_only_df["series"] = bw_only_df["series"].replace(
+                {"Baseline bandwidth": "Raw bandwidth"}
+            )
+            BW_ONLY_COLORS = {
+                "Raw bandwidth":         "#d62728",  # red
+                "StreamSense bandwidth": "#1f77b4",  # blue
+            }
+            bw_only_domain = list(BW_ONLY_COLORS.keys())
+            bw_only_range = [BW_ONLY_COLORS[s] for s in bw_only_domain]
+            try:
+                import altair as alt
+                bw_only_scale = (
+                    alt.Scale(zero=True) if bw_ymax is None
+                    else alt.Scale(domain=[0, bw_ymax], clamp=True)
+                )
+                bw_only_chart = (
+                    alt.Chart(bw_only_df)
+                    .mark_line(strokeWidth=2)
+                    .encode(
+                        x=alt.X("time_sec:Q", title="Time (s)"),
+                        y=alt.Y("kbps:Q", title="Bandwidth (kbps)", scale=bw_only_scale),
+                        color=alt.Color(
+                            "series:N", title="Stream",
+                            scale=alt.Scale(domain=bw_only_domain, range=bw_only_range),
+                            legend=alt.Legend(orient="top"),
+                        ),
+                        tooltip=[
+                            alt.Tooltip("series:N", title="Stream"),
+                            alt.Tooltip("time_sec:Q", title="Time (s)", format=".2f"),
+                            alt.Tooltip("kbps:Q", title="kbps", format=".1f"),
+                        ],
+                    )
+                    .properties(width=900, height=300)
+                )
+                st.altair_chart(bw_only_chart, use_container_width=False)
+            except Exception:
+                st.line_chart(
+                    bw_only_df.pivot_table(index="time_sec", columns="series", values="kbps")
+                              .sort_index()
                 )
 
     if auto_refresh:

@@ -9,6 +9,6 @@ __pycache__/
 /.venv/
 
 runs/
-configs/camera_pi.json
+
 
 comments.txt

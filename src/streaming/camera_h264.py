@@ -25,7 +25,7 @@ SERVER_IP = "localhost"
 PORT = 9999
 FIXED_CRF = None
 WIDTH, HEIGHT = 640, 480
-LOG_BANDWIDTH_EVERY_SEC = 60
+LOG_BANDWIDTH_EVERY_SEC = 10.0
 INITIAL_CRF = 30
 
 log = logging.getLogger("echostream.camera")
@@ -64,6 +64,7 @@ class SegmentEncoder:
             "-crf", str(crf),
             "-g", str(self.gop),
             "-sc_threshold", "0",
+            "-x264-params", "aq-mode=2:aq-strength=1.3",
             "-f", "h264",
             "pipe:1",
         ]
@@ -131,6 +132,10 @@ class ConfidenceListener:
                 segment_id, conf, heat_w, heat_h, num_boxes = struct.unpack(
                     "!IfHHH", header,
                 )
+                if not np.isfinite(conf):
+                    if self.counters is not None:
+                        self.counters.record_invalid_response()
+                    continue
                 conf = max(0.0, min(1.0, conf))
                 segment_id = int(segment_id)
                 heat_w = int(heat_w)
@@ -157,7 +162,7 @@ class ConfidenceListener:
                 new_crf = self._pid.update(conf)
                 event_to_set = None
                 with self._lock:
-                    self._pending_segments.pop(segment_id, None)
+                    frame_count = self._pending_segments.pop(segment_id, None)
                     self._segment_confidences[segment_id] = conf
                     # Trim old per-segment entries so the dicts can't grow
                     # unboundedly across a long run.
@@ -189,9 +194,12 @@ class ConfidenceListener:
         """Register that we have sent a segment and are waiting for its
         per-segment response. Idempotent for repeated calls with the same id.
         """
+        frame_count = max(1, int(frame_count))
         with self._lock:
-            self._pending_segments[int(segment_id)] = int(frame_count)
+            self._pending_segments[int(segment_id)] = frame_count
             self._segment_events.setdefault(int(segment_id), threading.Event())
+        if self.counters is not None:
+            self.counters.record_response_expected(frame_count)
 
     def confidence_for_segment(self, segment_id: int,
                                default: "float | None" = None) -> float:
@@ -433,6 +441,7 @@ def main():
     classes = parse_classes(args.classes) or ["object"]
     cap, input_source, probed_fps = _open_input(args.input, args.width, args.height)
     fps = float(probed_fps)
+    gop = fps//3 if fps >= 3 else 1 # SO IMPORTANT LIKE SO IMPORTANT
 
     # The "masked" socket carries the adaptive ROI-masked stream; this is the
     # original (and only) connection in the previous pipeline.
@@ -457,7 +466,7 @@ def main():
     # -----set up shared state and background threads-----
     counters = PipelineCounters(expected_fps=fps)
     masker = OpticalFlowMasker(motion_threshold=3.0, min_contour_area=1200)
-    encoder = SegmentEncoder(width=args.width, height=args.height, fps=fps, gop=int(fps))
+    encoder = SegmentEncoder(width=args.width, height=args.height, fps=fps, gop=int(gop))
     controller_type = str(getattr(args, "controller_type", "pid")).lower()
 
     def _build_controller():
@@ -529,7 +538,7 @@ def main():
             width=args.width,
             height=args.height,
             fps=fps,
-            gop_size=fps,
+            gop_size=gop,
             classes=classes,
             model=args.model,
             device="server",
@@ -891,6 +900,7 @@ def main():
     segment_baseline = 0
     next_segment_id = 0
     current_segment_id: "int | None" = None
+    current_segment_crf = None
     frame_index = 0
     baseline_crf = int(getattr(args, "baseline_crf", 20) or 20)
 
@@ -966,11 +976,7 @@ def main():
                     crf_transition_count["count"] += 1
                     crf_transition_count["prev"] = current_segment_crf
 
-            if not segment_items:
-                current_segment_id = next_segment_id
-                next_segment_id += 1
-
-            segment_baseline += estimate_baseline_bytes(frame, active_crf)
+            segment_baseline += estimate_baseline_bytes(frame, current_segment_crf)
             segment_items.append({
                 "frame_index": frame_index,
                 "original": frame.copy(),
@@ -982,7 +988,7 @@ def main():
             })
 
             # Flush a full GOP to the encode queue once we've accumulated enough frames.
-            if len(segment_items) >= fps:
+            if len(segment_items) >= gop: # CONFIG: fps = 1 second segments, gop = half-second
                 try:
                     encode_queue.put_nowait((
                         current_segment_id,
@@ -1001,6 +1007,7 @@ def main():
                 segment_items = []
                 segment_baseline = 0
                 current_segment_id = None
+                current_segment_crf = None
 
             if not args.no_preview:
                 with shared_lock:
@@ -1162,7 +1169,7 @@ def main():
                     width=args.width,
                     height=args.height,
                     fps=fps,
-                    gop_size=fps,
+                    gop_size=gop,
                     classes=classes,
                     model=args.model,
                     device="server",

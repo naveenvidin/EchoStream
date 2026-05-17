@@ -689,7 +689,7 @@ def main():
                             except queue.Full:
                                 pass
 
-                    segment_conf = float(np.percentile(np.array(frame_confs, dtype=np.float32), 10))
+                    segment_conf = float(np.percentile(np.array(frame_confs, dtype=np.float32), 50))
                     if latest_heatmap is None:
                         latest_heatmap = np.zeros((heat_h, heat_w), dtype=np.uint8)
                     send_segment_feedback(
