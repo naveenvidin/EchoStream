@@ -24,14 +24,14 @@
     "mirror_host": "localhost",
     "mirror_port": 9997,
     "controller_type": "discrete",
-    "pid_target": 0.78,
-    "pid_kp": 8.0,
-    "pid_ki": 1.0,
-    "pid_kd": 0.0,
-    "pid_max_step": 2.0,
-    "pid_deadband": 0.02,
-    "pid_crf_min": 18,
-    "pid_crf_max": 43
+    "crf_target_conf": 0.78,
+    "crf_conf_margin": 0.02,
+    "crf_ema_alpha": 0.30,
+    "crf_up_step": 1,
+    "crf_down_step": 2,
+    "crf_probe_interval": 5,
+    "crf_min": 18,
+    "crf_max": 43
   },
   "server_h264": {
     "tracker": "kalman",
