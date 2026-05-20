@@ -18,7 +18,7 @@ import cv2
 import numpy as np
 
 from src.optical_flow.motion_masker import OpticalFlowMasker
-from src.streaming.pid_controller import CrfPIDController, DiscreteStepCrfController
+from src.streaming.crf_controller import DiscreteStepCrfController, EmaProbeCrfController
 
 
 SERVER_IP = "localhost"
@@ -38,19 +38,35 @@ class SegmentEncoder:
     GOP size matches FPS so each segment is exactly one keyframe-aligned group.
     """
 
-    def __init__(self, width: int, height: int, fps: float, gop: int):
+    def __init__(self, width: int, height: int, fps: float, gop: int, baseline: bool = False):
         self.width = width
         self.height = height
         # Frames-per-second for the rawvideo input to ffmpeg. This must match the
         # real capture cadence; tying it to GOP makes streams appear choppy/slow.
         self.fps = float(fps)
         self.gop = int(gop)
+        self.baseline = bool(baseline)
         log.info(
-            "SegmentEncoder init width=%d height=%d fps=%.2f gop=%d",
-            self.width, self.height, self.fps, self.gop,
+            "SegmentEncoder init width=%d height=%d fps=%.2f gop=%d baseline=%s",
+            self.width, self.height, self.fps, self.gop, self.baseline,
         )
 
     def _build_cmd(self, crf: int) -> list[str]:
+        if self.baseline:
+            return [
+                "ffmpeg", "-loglevel", "quiet",
+                "-f", "rawvideo",
+                "-pix_fmt", "bgr24",
+                "-s", f"{self.width}x{self.height}",
+                "-i", "pipe:0",
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-tune", "zerolatency",
+                "-crf", str(crf),
+                "-f", "h264",
+                "pipe:1",
+            ]
+
         return [
             "ffmpeg", "-loglevel", "quiet",
             "-f", "rawvideo",
@@ -92,10 +108,10 @@ class ConfidenceListener:
     # session does not leak memory through the per-segment dicts.
     _SEGMENT_MEMORY = 256
 
-    def __init__(self, sock: socket.socket, pid: CrfPIDController, counters=None):
+    def __init__(self, sock: socket.socket, controller, counters=None):
         self.sock = sock
         self.counters = counters
-        self._pid = pid
+        self._controller = controller
         self._current_crf = INITIAL_CRF
         self._next_crf = INITIAL_CRF
         self._crf_value = float(INITIAL_CRF)
@@ -159,7 +175,7 @@ class ConfidenceListener:
                         x1, y1, x2, y2, c = struct.unpack("!fffff", box_bytes[off:off + 20])
                         boxes.append((x1, y1, x2, y2, c))
 
-                new_crf = self._pid.update(conf)
+                new_crf = self._controller.update(conf)
                 event_to_set = None
                 with self._lock:
                     frame_count = self._pending_segments.pop(segment_id, None)
@@ -264,7 +280,7 @@ def estimate_baseline_bytes(frame: np.ndarray, crf: int) -> int:
 
     NOTE: this is *not* the same baseline as `[BW_BASE]`. This function
     encodes each raw frame as a standalone JPEG (no inter-frame
-    compression) at a quality derived from the current PID-chosen CRF, so
+    compression) at a quality derived from the current adaptive CRF, so
     the denominator both lacks H.264's GOP gains and tracks the
     controller. The result is much larger than the actual H.264 baseline
     stream's bytes, which is why `[BW] saved` reads higher than the true
@@ -467,58 +483,60 @@ def main():
     counters = PipelineCounters(expected_fps=fps)
     masker = OpticalFlowMasker(motion_threshold=3.0, min_contour_area=1200)
     encoder = SegmentEncoder(width=args.width, height=args.height, fps=fps, gop=int(gop))
-    controller_type = str(getattr(args, "controller_type", "pid")).lower()
+    baseline_encoder = SegmentEncoder(width=args.width, height=args.height, fps=fps, gop=int(gop), baseline=True)
+    controller_type = str(getattr(args, "controller_type", "ema_probe")).lower()
 
     def _build_controller():
         if controller_type == "discrete":
             return DiscreteStepCrfController(initial_crf=INITIAL_CRF)
-        return CrfPIDController(
-            target=float(getattr(args, "pid_target", 0.78)),
-            kp=float(getattr(args, "pid_kp", 8.0)),
-            ki=float(getattr(args, "pid_ki", 1.0)),
-            kd=float(getattr(args, "pid_kd", 0.0)),
-            max_step=float(getattr(args, "pid_max_step", 2.0)),
-            deadband=float(getattr(args, "pid_deadband", 0.02)),
-            crf_min=int(getattr(args, "pid_crf_min", 18)),
-            crf_max=int(getattr(args, "pid_crf_max", 43)),
+        return EmaProbeCrfController(
+            target=float(getattr(args, "crf_target_conf", 0.70)),
+            margin=float(getattr(args, "crf_conf_margin", 0.03)),
+            ema_alpha=float(getattr(args, "crf_ema_alpha", 0.30)),
+            up_step=int(getattr(args, "crf_up_step", 1)),
+            down_step=int(getattr(args, "crf_down_step", 2)),
+            probe_interval=int(getattr(args, "crf_probe_interval", 5)),
+            crf_min=int(getattr(args, "crf_min", 23)),
+            crf_max=int(getattr(args, "crf_max", 43)),
             initial_crf=INITIAL_CRF,
         )
 
-    pid = _build_controller()
-    if isinstance(pid, CrfPIDController):
+    controller = _build_controller()
+    if isinstance(controller, EmaProbeCrfController):
         log.info(
-            "PID adaptive CRF: target=%.2f kp=%.2f ki=%.2f kd=%.2f "
-            "step=%.2f deadband=%.3f range=[%d,%d]",
-            pid.target, pid.kp, pid.ki, pid.kd,
-            pid.max_step, pid.deadband, pid.crf_min, pid.crf_max,
+            "EMA-probe adaptive CRF: target=%.2f margin=%.3f alpha=%.2f "
+            "up=%d down=%d probe_interval=%d range=[%d,%d]",
+            controller.target, controller.margin, controller.ema_alpha,
+            controller.up_step, controller.down_step, controller.probe_interval,
+            controller.crf_min, controller.crf_max,
         )
         controller_meta = {
-            "type": "pid",
+            "type": "ema_probe",
             "initial_crf": INITIAL_CRF,
-            "target": pid.target,
-            "kp": pid.kp,
-            "ki": pid.ki,
-            "kd": pid.kd,
-            "max_step": pid.max_step,
-            "deadband": pid.deadband,
-            "crf_min": pid.crf_min,
-            "crf_max": pid.crf_max,
+            "target": controller.target,
+            "margin": controller.margin,
+            "ema_alpha": controller.ema_alpha,
+            "up_step": controller.up_step,
+            "down_step": controller.down_step,
+            "probe_interval": controller.probe_interval,
+            "crf_min": controller.crf_min,
+            "crf_max": controller.crf_max,
         }
     else:
         log.info(
             "Discrete-step CRF controller: levels=%s",
-            getattr(pid, "LEVELS", []),
+            getattr(controller, "LEVELS", []),
         )
         controller_meta = {
             "type": "discrete",
             "initial_crf": INITIAL_CRF,
-            "levels": list(getattr(pid, "LEVELS", [])),
+            "levels": list(getattr(controller, "LEVELS", [])),
         }
 
-    listener = ConfidenceListener(sock=masked_socket, pid=pid, counters=counters)
+    listener = ConfidenceListener(sock=masked_socket, controller=controller, counters=counters)
     baseline_listener = None
     if baseline_socket is not None:
-        baseline_listener = ConfidenceListener(sock=baseline_socket, pid=_build_controller(), counters=None)
+        baseline_listener = ConfidenceListener(sock=baseline_socket, controller=_build_controller(), counters=None)
 
     run_dir = args.output_dir
     if args.save_artifacts and not run_dir:
@@ -605,8 +623,9 @@ def main():
     elif args.record_input:
         log.info("--record-input ignored for file input; use the file path for replay.")
 
-    encode_queue = queue.Queue(maxsize=3)
-    baseline_encode_queue = queue.Queue(maxsize=3) if baseline_socket is not None else None
+    max_queue_size = int(3.0*fps/gop)
+    encode_queue = queue.Queue(maxsize=max_queue_size)
+    baseline_encode_queue = queue.Queue(maxsize=max_queue_size) if baseline_socket is not None else None
     shared_lock = threading.Lock()
     last_raw = {"frame": None}
     last_masked = {"frame": None}
@@ -808,7 +827,7 @@ def main():
             return
         try:
             frames = [item["original"] for item in segment_items]
-            data = encoder.encode(frames, crf)
+            data = baseline_encoder.encode(frames, crf)
             if not data:
                 return
             header = struct.pack("!II", int(segment_id), len(data))
