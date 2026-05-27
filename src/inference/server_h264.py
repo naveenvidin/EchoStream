@@ -417,20 +417,88 @@ def person_boxes_for_wire(detector, detections, person_cls_idx):
     return boxes_for_wire
 
 
-def boxes_to_heatmap(boxes_for_wire, frame_shape, heat_w: int, heat_h: int) -> np.ndarray:
-    heatmap = np.zeros((heat_h, heat_w), dtype=np.uint8)
+def recency_heat_value(frame_index: int, frame_count: int) -> int:
+    if frame_count <= 1:
+        return 255
+    frame_index = max(0, min(int(frame_index), int(frame_count) - 1))
+    return int(round(1 + frame_index * (254.0 / float(frame_count - 1))))
+
+
+def heatmap_padding_pct(
+    box_area_ratio: float,
+    min_pct: float,
+    max_pct: float,
+    small_area_ratio: float,
+    large_area_ratio: float,
+) -> float:
+    min_pct = max(0.0, float(min_pct))
+    max_pct = max(min_pct, float(max_pct))
+    small_area_ratio = max(0.0, float(small_area_ratio))
+    large_area_ratio = max(small_area_ratio + 1e-6, float(large_area_ratio))
+
+    if box_area_ratio <= small_area_ratio:
+        return max_pct
+    if box_area_ratio >= large_area_ratio:
+        return min_pct
+
+    span = large_area_ratio - small_area_ratio
+    t = (float(box_area_ratio) - small_area_ratio) / span
+    return max_pct + (min_pct - max_pct) * t
+
+
+def add_boxes_to_heatmap(
+    heatmap: np.ndarray,
+    boxes_for_wire,
+    frame_shape,
+    value: int,
+    padding_min_pct: float = 0.0,
+    padding_max_pct: float = 0.0,
+    padding_small_area_ratio: float = 0.01,
+    padding_large_area_ratio: float = 0.25,
+) -> np.ndarray:
     frame_h, frame_w = frame_shape[:2]
+    heat_h, heat_w = heatmap.shape[:2]
     if boxes_for_wire:
+        value = np.uint8(max(0, min(255, int(value))))
         sx = heat_w / float(max(frame_w, 1))
         sy = heat_h / float(max(frame_h, 1))
+        frame_area = float(max(frame_w * frame_h, 1))
         for x1, y1, x2, y2, _c in boxes_for_wire:
+            box_w = max(0.0, float(x2) - float(x1))
+            box_h = max(0.0, float(y2) - float(y1))
+            pad_pct = heatmap_padding_pct(
+                (box_w * box_h) / frame_area,
+                padding_min_pct,
+                padding_max_pct,
+                padding_small_area_ratio,
+                padding_large_area_ratio,
+            )
+            log.info(
+                "heatmap padding pct=%.3f box_area_ratio=%.4f box=%.1fx%.1f",
+                pad_pct,
+                (box_w * box_h) / frame_area,
+                box_w,
+                box_h,
+            )
+            pad_x = box_w * pad_pct
+            pad_y = box_h * pad_pct
+            x1 -= pad_x
+            y1 -= pad_y
+            x2 += pad_x
+            y2 += pad_y
             hx1 = int(max(0, min(heat_w - 1, np.floor(x1 * sx))))
             hy1 = int(max(0, min(heat_h - 1, np.floor(y1 * sy))))
             hx2 = int(max(1, min(heat_w, np.ceil(x2 * sx))))
             hy2 = int(max(1, min(heat_h, np.ceil(y2 * sy))))
             if hx2 > hx1 and hy2 > hy1:
-                heatmap[hy1:hy2, hx1:hx2] = 255
+                roi = heatmap[hy1:hy2, hx1:hx2]
+                np.maximum(roi, value, out=roi)
     return heatmap
+
+
+def boxes_to_heatmap(boxes_for_wire, frame_shape, heat_w: int, heat_h: int) -> np.ndarray:
+    heatmap = np.zeros((heat_h, heat_w), dtype=np.uint8)
+    return add_boxes_to_heatmap(heatmap, boxes_for_wire, frame_shape, 255)
 
 
 def send_segment_feedback(conn, segment_id: int, conf: float, heatmap: np.ndarray, boxes_for_wire):
@@ -502,6 +570,20 @@ def _parse_args() -> argparse.Namespace:
                    help="Override decoded frame width.")
     p.add_argument("--height", type=int, default=None,
                    help="Override decoded frame height.")
+    p.add_argument("--heatmap-padding-min-pct", dest="heatmap_padding_min_pct",
+                   type=float, default=None,
+                   help="Minimum box padding as a fraction of box width/height.")
+    p.add_argument("--heatmap-padding-max-pct", dest="heatmap_padding_max_pct",
+                   type=float, default=None,
+                   help="Maximum box padding as a fraction of box width/height.")
+    p.add_argument("--heatmap-padding-small-area-ratio",
+                   dest="heatmap_padding_small_area_ratio",
+                   type=float, default=None,
+                   help="Frame area ratio at/below which max padding is used.")
+    p.add_argument("--heatmap-padding-large-area-ratio",
+                   dest="heatmap_padding_large_area_ratio",
+                   type=float, default=None,
+                   help="Frame area ratio at/above which min padding is used.")
     p.add_argument("--show-window", action="store_true",
                    help="Override show_window=true (server-side preview).")
     p.add_argument("--save-artifacts", dest="save_artifacts",
@@ -524,6 +606,18 @@ def _parse_args() -> argparse.Namespace:
     args.host = getattr(args, "host", None) or "0.0.0.0"
     args.save_artifacts = bool(getattr(args, "save_artifacts", False))
     args.output_dir = getattr(args, "output_dir", None)
+    args.heatmap_padding_min_pct = float(
+        getattr(args, "heatmap_padding_min_pct", 0.08)
+    )
+    args.heatmap_padding_max_pct = float(
+        getattr(args, "heatmap_padding_max_pct", 0.50)
+    )
+    args.heatmap_padding_small_area_ratio = float(
+        getattr(args, "heatmap_padding_small_area_ratio", 0.01)
+    )
+    args.heatmap_padding_large_area_ratio = float(
+        getattr(args, "heatmap_padding_large_area_ratio", 0.20)
+    )
 
     overrides = {
         "model": cli.model,
@@ -536,6 +630,10 @@ def _parse_args() -> argparse.Namespace:
         "port": cli.port,
         "width": cli.width,
         "height": cli.height,
+        "heatmap_padding_min_pct": cli.heatmap_padding_min_pct,
+        "heatmap_padding_max_pct": cli.heatmap_padding_max_pct,
+        "heatmap_padding_small_area_ratio": cli.heatmap_padding_small_area_ratio,
+        "heatmap_padding_large_area_ratio": cli.heatmap_padding_large_area_ratio,
         "output_dir": cli.output_dir,
     }
     for key, value in overrides.items():
@@ -597,6 +695,13 @@ def main():
         "listening on %s:%d model=%s classes=%s device=%s",
         bind_host, args.port, args.model, classes, detector.device,
     )
+    log.info(
+        "heatmap padding min=%.2f max=%.2f small_area=%.3f large_area=%.3f",
+        args.heatmap_padding_min_pct,
+        args.heatmap_padding_max_pct,
+        args.heatmap_padding_small_area_ratio,
+        args.heatmap_padding_large_area_ratio,
+    )
 
     artifacts: Optional[ServerArtifacts] = None
     conn = None
@@ -632,6 +737,10 @@ def main():
                 "width": args.width,
                 "height": args.height,
                 "fps": fps,
+                "heatmap_padding_min_pct": args.heatmap_padding_min_pct,
+                "heatmap_padding_max_pct": args.heatmap_padding_max_pct,
+                "heatmap_padding_small_area_ratio": args.heatmap_padding_small_area_ratio,
+                "heatmap_padding_large_area_ratio": args.heatmap_padding_large_area_ratio,
                 "client_addr": f"{addr[0]}:{addr[1]}",
                 "start_wall_time": time.time(),
             })
@@ -664,19 +773,33 @@ def main():
                         continue
 
                     frame_confs = []
-                    latest_heatmap = None
                     latest_boxes_for_wire = []
                     heat_w, heat_h = detector.heatmap_size
+                    segment_heatmap = np.zeros((heat_h, heat_w), dtype=np.uint8)
+                    frame_count = len(frames)
 
-                    for frame in frames:
+                    for frame_index, frame in enumerate(frames):
                         conf, _heatmap, detections, _infer_us = detector.infer(frame)
                         boxes_for_wire = person_boxes_for_wire(detector, detections, person_cls_idx)
                         if boxes_for_wire:
                             conf = float(min(b[4] for b in boxes_for_wire))
+                            latest_boxes_for_wire = boxes_for_wire
 
                         frame_confs.append(float(conf))
-                        latest_boxes_for_wire = boxes_for_wire
-                        latest_heatmap = boxes_to_heatmap(boxes_for_wire, frame.shape, heat_w, heat_h)
+                        add_boxes_to_heatmap(
+                            segment_heatmap,
+                            boxes_for_wire,
+                            frame.shape,
+                            recency_heat_value(frame_index, frame_count),
+                            padding_min_pct=args.heatmap_padding_min_pct,
+                            padding_max_pct=args.heatmap_padding_max_pct,
+                            padding_small_area_ratio=(
+                                args.heatmap_padding_small_area_ratio
+                            ),
+                            padding_large_area_ratio=(
+                                args.heatmap_padding_large_area_ratio
+                            ),
+                        )
 
                         if args.show_window:
                             if result_q.full():
@@ -690,13 +813,11 @@ def main():
                                 pass
 
                     segment_conf = float(np.percentile(np.array(frame_confs, dtype=np.float32), 50))
-                    if latest_heatmap is None:
-                        latest_heatmap = np.zeros((heat_h, heat_w), dtype=np.uint8)
                     send_segment_feedback(
                         conn,
                         segment_id,
                         segment_conf,
-                        latest_heatmap,
+                        segment_heatmap,
                         latest_boxes_for_wire,
                     )
                 except (BrokenPipeError, ConnectionError, OSError, struct.error) as e:

@@ -1,6 +1,6 @@
 {
   "camera_h264": {
-    "input": "0",
+    "input": "Berghouse-Leopard-Jog.mp4",
     "loop_video": false,
     "max_frames": null,
     "server_ip": "localhost",
@@ -13,7 +13,7 @@
     "classes": "person",
     "model": "yolov8s-world.pt",
     "save_artifacts": false,
-    "output_dir": null,
+    "output_dir": "runs/sample",
     "record_input": null,
     "record_input_fps": null,
     "record_input_max_frames": null,
@@ -44,6 +44,10 @@
     "port": 9999,
     "width": 640,
     "height": 480,
+    "heatmap_padding_min_pct": 0.08,
+    "heatmap_padding_max_pct": 0.50,
+    "heatmap_padding_small_area_ratio": 0.01,
+    "heatmap_padding_large_area_ratio": 0.20,
     "show_window": true,
     "save_artifacts": false,
     "output_dir": null
