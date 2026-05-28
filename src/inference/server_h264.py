@@ -2,12 +2,17 @@
 
 Camera -> server:
     [4-byte big-endian float: camera FPS]           (handshake, sent once on connect)
-    [uint32 segment_id][uint32 payload length][raw H.264 segment]  (repeated)
+    [uint32 segment_id][uint32 payload_length][raw H.264 segment]  (repeated)
 
-Server -> camera (per segment):
-    [uint32 segment_id][float32 p10_conf][uint16 heat_w][uint16 heat_h][uint16 num_boxes]
+Server -> camera (per decoded frame):
+    [uint32 segment_id][float32 metric][uint16 heat_w][uint16 heat_h][uint16 num_boxes]
     [heatmap bytes: heat_w*heat_h uint8]
     [boxes bytes: num_boxes * (x1,y1,x2,y2,conf) float32]
+
+The segment_id flows camera→server→camera so per-frame responses can be
+attributed to the segment they came from, rather than being treated as
+undifferentiated "latest" updates. Server assumes one segment carries
+exactly `int(fps)` decoded frames (camera's GOP == fps).
 
 Only the detector is additive: fixed YOLOv8n is replaced by YOLO-World
 with prompted classes supplied on the server CLI.
@@ -15,6 +20,8 @@ with prompted classes supplied on the server CLI.
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import logging
 import queue
 import socket
@@ -22,6 +29,8 @@ import struct
 import subprocess
 import threading
 import time
+from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -31,6 +40,211 @@ PORT = 9999
 WIDTH, HEIGHT = 640, 480
 
 log = logging.getLogger("echostream.server")
+
+
+class H264Decoder:
+    """Persistent ffmpeg subprocess that accepts raw H.264 bytes and emits decoded
+    BGR frames into an internal queue for downstream consumption.
+    """
+
+    def __init__(self, width: int = 640, height: int = 480, fps: float = 30.0):
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self._frame_bytes = width * height * 3
+        # Queue sized to hold ~3 seconds of frames at the negotiated FPS.
+        self._frame_q = queue.Queue(maxsize=int(fps * 3))
+        self._proc = None
+        self._reader_thread = None
+        self._start()
+
+    def _start(self):
+        cmd = [
+            "ffmpeg", "-loglevel", "quiet",
+            "-f", "h264",
+            "-i", "pipe:0",
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "pipe:1",
+        ]
+        self._proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+        )
+        self._reader_thread = threading.Thread(
+            target=self._drain_stdout, daemon=True,
+        )
+        self._reader_thread.start()
+
+    def _drain_stdout(self):
+        """Read decoded frames from ffmpeg stdout and push them to the frame queue.
+        If the queue is full, drop the oldest frame to make room so the producer
+        never blocks on a slow consumer.
+        """
+        while True:
+            raw = self._proc.stdout.read(self._frame_bytes)
+            if len(raw) < self._frame_bytes:
+                break
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape(
+                (self.height, self.width, 3),
+            ).copy()
+            if self._frame_q.full():
+                log.debug("full, dropping frames in drain, bad")
+                try:
+                    self._frame_q.get_nowait()
+                except queue.Empty:
+                    pass
+            try:
+                self._frame_q.put_nowait(frame)
+            except queue.Full:
+                pass
+
+    def push(self, nal_bytes: bytes):
+        """Write a raw H.264 segment into the ffmpeg decoder's stdin."""
+        try:
+            self._proc.stdin.write(nal_bytes)
+            self._proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+
+    def get_frame(self):
+        try:
+            return self._frame_q.get_nowait()
+        except queue.Empty:
+            return None
+
+    def close(self):
+        try:
+            self._proc.stdin.close()
+            self._proc.wait(timeout=3)
+        except Exception:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+
+
+class ServerArtifacts:
+    """Server-side artifact writer.
+
+    Mirrors the camera's `--save-artifacts` workflow but for what the
+    server actually sees and produces:
+
+      <output_dir>/decoded.mp4          decoded H.264 frames as received
+      <output_dir>/annotated.mp4        decoded frames with detection boxes
+      <output_dir>/server_metrics.csv   per-frame inference stats
+      <output_dir>/server_config.json   run config snapshot
+
+    Synchronous on the inference thread. Inference dominates the loop
+    budget by orders of magnitude over disk on a GPU box, so the async
+    worker pattern used by the camera-side artifacts is unnecessary
+    here. Zero-overhead when `enabled=False`.
+    """
+
+    COLUMNS = [
+        "frame_index", "timestamp_sec", "num_boxes",
+        "conf_min", "conf_max", "conf_mean",
+        "infer_ms",
+    ]
+
+    def __init__(self, output_dir: Optional[str], width: int, height: int,
+                 fps: float, enabled: bool = True):
+        self.enabled = bool(enabled and output_dir)
+        if not self.enabled:
+            return
+        self.run_dir = Path(output_dir)
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.width = int(width)
+        self.height = int(height)
+        self.fps = float(fps) if fps and fps > 0 else 30.0
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        self._decoded_writer = cv2.VideoWriter(
+            str(self.run_dir / "decoded.mp4"), fourcc, self.fps,
+            (self.width, self.height),
+        )
+        self._annotated_writer = cv2.VideoWriter(
+            str(self.run_dir / "annotated.mp4"), fourcc, self.fps,
+            (self.width, self.height),
+        )
+        self._csv_file = open(self.run_dir / "server_metrics.csv",
+                              "w", newline="")
+        self._csv = csv.DictWriter(self._csv_file, fieldnames=self.COLUMNS)
+        self._csv.writeheader()
+
+        self._t0 = time.time()
+        self._frame_idx = 0
+        log.info("server artifacts -> %s", self.run_dir)
+
+    def write_session_config(self, cfg: dict) -> None:
+        if not self.enabled:
+            return
+        try:
+            (self.run_dir / "server_config.json").write_text(
+                json.dumps(cfg, indent=2, default=str)
+            )
+        except Exception as e:
+            log.debug("server_config write failed: %s", e)
+
+    def write_frame(self, decoded: np.ndarray, boxes: list,
+                    infer_ms: float) -> None:
+        """Write decoded + annotated frames and a CSV row.
+
+        `boxes` follows the wire format used by inference_loop:
+        list of (x1, y1, x2, y2, conf) floats.
+        """
+        if not self.enabled or decoded is None:
+            return
+        try:
+            annotated = decoded.copy()
+            for x1, y1, x2, y2, c in boxes:
+                p1 = (int(x1), int(y1))
+                p2 = (int(x2), int(y2))
+                cv2.rectangle(annotated, p1, p2, (0, 255, 255), 2)
+                cv2.putText(
+                    annotated, f"{c:.2f}",
+                    (p1[0], max(0, p1[1] - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1,
+                    cv2.LINE_AA,
+                )
+            self._decoded_writer.write(decoded)
+            self._annotated_writer.write(annotated)
+        except Exception as e:
+            log.debug("server video write failed: %s", e)
+
+        confs = [float(b[4]) for b in boxes] if boxes else []
+        row = {
+            "frame_index": self._frame_idx,
+            "timestamp_sec": round(time.time() - self._t0, 6),
+            "num_boxes": len(boxes),
+            "conf_min": f"{min(confs):.6f}" if confs else "",
+            "conf_max": f"{max(confs):.6f}" if confs else "",
+            "conf_mean": f"{(sum(confs) / len(confs)):.6f}" if confs else "",
+            "infer_ms": f"{float(infer_ms):.3f}",
+        }
+        try:
+            self._csv.writerow(row)
+        except Exception as e:
+            log.debug("server csv write failed: %s", e)
+        self._frame_idx += 1
+
+    def close(self) -> None:
+        if not self.enabled:
+            return
+        for w in (getattr(self, "_decoded_writer", None),
+                  getattr(self, "_annotated_writer", None)):
+            try:
+                if w is not None:
+                    w.release()
+            except Exception:
+                pass
+        try:
+            if self._csv_file is not None:
+                self._csv_file.flush()
+                self._csv_file.close()
+        except Exception:
+            pass
 
 
 def _recv_exact(conn, size: int):
@@ -45,40 +259,140 @@ def _recv_exact(conn, size: int):
     return b"".join(chunks)
 
 
-def _decode_h264_segment(data: bytes, width: int, height: int) -> list[np.ndarray]:
-    if not data:
-        return []
-    cmd = [
-        "ffmpeg", "-loglevel", "quiet",
-        "-f", "h264",
-        "-i", "pipe:0",
-        "-f", "rawvideo",
-        "-pix_fmt", "bgr24",
-        "pipe:1",
-    ]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-    raw, _ = proc.communicate(input=data)
-    frame_bytes = width * height * 3
-    frames = []
-    for off in range(0, len(raw) - frame_bytes + 1, frame_bytes):
-        frames.append(
-            np.frombuffer(raw[off:off + frame_bytes], dtype=np.uint8)
-            .reshape((height, width, 3))
-            .copy()
-        )
-    return frames
-
-
 def receive_segment(conn):
+    """Read one camera segment from the socket.
+
+    Camera-side header is `!II` = (uint32 segment_id, uint32 payload_length),
+    followed by `payload_length` raw H.264 bytes (one GOP).
+
+    Returns (segment_id, segment_bytes) or None on EOF / connection loss.
+    """
     header = _recv_exact(conn, 8)
     if not header:
         return None
     segment_id, payload_size = struct.unpack("!II", header)
-    segment_data = _recv_exact(conn, payload_size)
-    if not segment_data:
+    if payload_size <= 0:
+        return int(segment_id), b""
+    segment_data = _recv_exact(conn, int(payload_size))
+    if segment_data is None:
         return None
     return int(segment_id), segment_data
 
+
+def _decode_h264_segment(segment_data: bytes, width: int, height: int):
+    """Decode one self-contained H.264 segment (1 GOP) into BGR frames.
+
+    Runs a one-shot ffmpeg subprocess per segment: write the segment to stdin,
+    read raw BGR frames from stdout. Returns [] on empty input or decode error.
+    """
+    if not segment_data:
+        return []
+    frame_bytes = int(width) * int(height) * 3
+    cmd = [
+        "ffmpeg", "-loglevel", "quiet",
+        "-f", "h264", "-i", "pipe:0",
+        "-f", "rawvideo", "-pix_fmt", "bgr24",
+        "pipe:1",
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        )
+        raw, _ = proc.communicate(input=segment_data, timeout=10)
+    except Exception as e:
+        log.debug("segment decode failed: %s", e)
+        return []
+    frames = []
+    for offset in range(0, len(raw) - frame_bytes + 1, frame_bytes):
+        chunk = raw[offset:offset + frame_bytes]
+        frame = np.frombuffer(chunk, dtype=np.uint8).reshape(
+            (int(height), int(width), 3)
+        ).copy()
+        frames.append(frame)
+    return frames
+
+
+def receive_loop(conn, decoder, segment_id_queue):
+    """Read (segment_id, length)-prefixed H.264 segments from the socket and
+    push each into the decoder. Segment_ids are also pushed onto
+    `segment_id_queue` so the inference loop can attribute decoded frames
+    back to the segment they came from.
+    """
+    while True:
+        try:
+            header = _recv_exact(conn, 8)
+            if not header:
+                break
+            segment_id, payload_size = struct.unpack("!II", header)
+            segment_data = _recv_exact(conn, payload_size)
+            if not segment_data:
+                break
+            decoder.push(segment_data)
+            try:
+                segment_id_queue.put_nowait(int(segment_id))
+            except queue.Full:
+                # Inference loop is far behind; drop oldest and retry once.
+                try:
+                    segment_id_queue.get_nowait()
+                    segment_id_queue.put_nowait(int(segment_id))
+                except (queue.Empty, queue.Full):
+                    pass
+        except (ConnectionError, OSError, struct.error) as e:
+            log.warning("receiver connection lost: %s", e)
+            break
+
+
+def inference_loop(decoder, detector, conn, result_q, stop_event,
+                   artifacts: Optional["ServerArtifacts"] = None,
+                   segment_id_queue: Optional["queue.Queue"] = None,
+                   frames_per_segment: int = 30):
+    """Pull decoded frames from the decoder, run YOLO inference, send the result
+    back to the camera over the socket, and push annotated frames to result_q for display.
+    Drops frames from result_q when the display thread falls behind.
+
+    When `artifacts` is provided, also writes the decoded frame, an annotated
+    copy, and a per-frame CSV row. Detection/tracking/protocol behaviour is
+    unchanged regardless.
+
+    Each response header carries the `segment_id` of the segment that this
+    decoded frame originated from. We assume `frames_per_segment` decoded
+    frames per pushed segment (camera enforces GOP == fps); when that
+    counter exhausts we pop the next id from `segment_id_queue`.
+    """
+    current_segment_id = 0
+    remaining_in_segment = 0
+    expected = max(int(frames_per_segment), 1)
+    while not stop_event.is_set():
+        frame = decoder.get_frame()
+        if frame is None:
+            log.debug("decoded queue empty, good thing")
+            time.sleep(0.005)
+            continue
+
+        # Advance to the next segment_id when the previous segment's frame
+        # budget has run out. Falls back to current_segment_id (0 on cold
+        # start) when the receiver hasn't seen the next header yet.
+        if remaining_in_segment <= 0 and segment_id_queue is not None:
+            try:
+                current_segment_id = int(segment_id_queue.get_nowait())
+                remaining_in_segment = expected
+            except queue.Empty:
+                remaining_in_segment = 1
+        if remaining_in_segment > 0:
+            remaining_in_segment -= 1
+
+        conf, _heatmap, detections, _infer_us = detector.infer(frame)
+        infer_ms = (
+            float(_infer_us) / 1000.0 if _infer_us else 0.0
+        )
+        person_dets = []
+        if detector is not None and getattr(detector, "class_names", None):
+            try:
+                person_cls_idx = detector.class_names.index("person")
+            except ValueError:
+                person_cls_idx = None
+        else:
+            person_cls_idx = None
 
 def person_boxes_for_wire(detector, detections, person_cls_idx):
     person_dets = []
@@ -103,20 +417,88 @@ def person_boxes_for_wire(detector, detections, person_cls_idx):
     return boxes_for_wire
 
 
-def boxes_to_heatmap(boxes_for_wire, frame_shape, heat_w: int, heat_h: int) -> np.ndarray:
-    heatmap = np.zeros((heat_h, heat_w), dtype=np.uint8)
+def recency_heat_value(frame_index: int, frame_count: int) -> int:
+    if frame_count <= 1:
+        return 255
+    frame_index = max(0, min(int(frame_index), int(frame_count) - 1))
+    return int(round(1 + frame_index * (254.0 / float(frame_count - 1))))
+
+
+def heatmap_padding_pct(
+    box_area_ratio: float,
+    min_pct: float,
+    max_pct: float,
+    small_area_ratio: float,
+    large_area_ratio: float,
+) -> float:
+    min_pct = max(0.0, float(min_pct))
+    max_pct = max(min_pct, float(max_pct))
+    small_area_ratio = max(0.0, float(small_area_ratio))
+    large_area_ratio = max(small_area_ratio + 1e-6, float(large_area_ratio))
+
+    if box_area_ratio <= small_area_ratio:
+        return max_pct
+    if box_area_ratio >= large_area_ratio:
+        return min_pct
+
+    span = large_area_ratio - small_area_ratio
+    t = (float(box_area_ratio) - small_area_ratio) / span
+    return max_pct + (min_pct - max_pct) * t
+
+
+def add_boxes_to_heatmap(
+    heatmap: np.ndarray,
+    boxes_for_wire,
+    frame_shape,
+    value: int,
+    padding_min_pct: float = 0.0,
+    padding_max_pct: float = 0.0,
+    padding_small_area_ratio: float = 0.01,
+    padding_large_area_ratio: float = 0.25,
+) -> np.ndarray:
     frame_h, frame_w = frame_shape[:2]
+    heat_h, heat_w = heatmap.shape[:2]
     if boxes_for_wire:
+        value = np.uint8(max(0, min(255, int(value))))
         sx = heat_w / float(max(frame_w, 1))
         sy = heat_h / float(max(frame_h, 1))
+        frame_area = float(max(frame_w * frame_h, 1))
         for x1, y1, x2, y2, _c in boxes_for_wire:
+            box_w = max(0.0, float(x2) - float(x1))
+            box_h = max(0.0, float(y2) - float(y1))
+            pad_pct = heatmap_padding_pct(
+                (box_w * box_h) / frame_area,
+                padding_min_pct,
+                padding_max_pct,
+                padding_small_area_ratio,
+                padding_large_area_ratio,
+            )
+            log.info(
+                "heatmap padding pct=%.3f box_area_ratio=%.4f box=%.1fx%.1f",
+                pad_pct,
+                (box_w * box_h) / frame_area,
+                box_w,
+                box_h,
+            )
+            pad_x = box_w * pad_pct
+            pad_y = box_h * pad_pct
+            x1 -= pad_x
+            y1 -= pad_y
+            x2 += pad_x
+            y2 += pad_y
             hx1 = int(max(0, min(heat_w - 1, np.floor(x1 * sx))))
             hy1 = int(max(0, min(heat_h - 1, np.floor(y1 * sy))))
             hx2 = int(max(1, min(heat_w, np.ceil(x2 * sx))))
             hy2 = int(max(1, min(heat_h, np.ceil(y2 * sy))))
             if hx2 > hx1 and hy2 > hy1:
-                heatmap[hy1:hy2, hx1:hx2] = 255
+                roi = heatmap[hy1:hy2, hx1:hx2]
+                np.maximum(roi, value, out=roi)
     return heatmap
+
+
+def boxes_to_heatmap(boxes_for_wire, frame_shape, heat_w: int, heat_h: int) -> np.ndarray:
+    heatmap = np.zeros((heat_h, heat_w), dtype=np.uint8)
+    return add_boxes_to_heatmap(heatmap, boxes_for_wire, frame_shape, 255)
 
 
 def send_segment_feedback(conn, segment_id: int, conf: float, heatmap: np.ndarray, boxes_for_wire):
@@ -131,6 +513,8 @@ def send_segment_feedback(conn, segment_id: int, conf: float, heatmap: np.ndarra
         int(len(boxes_for_wire)),
     )
     conn.sendall(header + heatmap.tobytes() + boxes_payload)
+
+
 
 
 def draw_hud(frame: np.ndarray, label: str, conf: float,
@@ -163,10 +547,51 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--config", default="configs/default.json",
                    help="JSON config file with defaults.")
+    # Each override defaults to None / False so the JSON config's value is
+    # only displaced when the flag is actually passed on the command line.
+    p.add_argument("--model", default=None,
+                   help="Override model path (YOLO-World checkpoint).")
+    p.add_argument("--classes", default=None,
+                   help="Override prompted classes, e.g. 'person,wallet,bed'.")
+    p.add_argument("--device", default=None,
+                   help="Override device: auto, cuda, mps, or cpu.")
+    p.add_argument("--conf-threshold", dest="conf_threshold",
+                   type=float, default=None,
+                   help="Override detector confidence floor.")
+    p.add_argument("--nms-iou", dest="nms_iou", type=float, default=None,
+                   help="Override NMS IoU threshold.")
+    p.add_argument("--tracker", default=None, choices=("kalman", "none"),
+                   help="Override tracker mode.")
+    p.add_argument("--host", default=None,
+                   help="Override bind host (config default 0.0.0.0).")
     p.add_argument("--port", type=int, default=None,
                    help="Override port from config.")
+    p.add_argument("--width", type=int, default=None,
+                   help="Override decoded frame width.")
+    p.add_argument("--height", type=int, default=None,
+                   help="Override decoded frame height.")
+    p.add_argument("--heatmap-padding-min-pct", dest="heatmap_padding_min_pct",
+                   type=float, default=None,
+                   help="Minimum box padding as a fraction of box width/height.")
+    p.add_argument("--heatmap-padding-max-pct", dest="heatmap_padding_max_pct",
+                   type=float, default=None,
+                   help="Maximum box padding as a fraction of box width/height.")
+    p.add_argument("--heatmap-padding-small-area-ratio",
+                   dest="heatmap_padding_small_area_ratio",
+                   type=float, default=None,
+                   help="Frame area ratio at/below which max padding is used.")
+    p.add_argument("--heatmap-padding-large-area-ratio",
+                   dest="heatmap_padding_large_area_ratio",
+                   type=float, default=None,
+                   help="Frame area ratio at/above which min padding is used.")
     p.add_argument("--show-window", action="store_true",
                    help="Override show_window=true (server-side preview).")
+    p.add_argument("--save-artifacts", dest="save_artifacts",
+                   action="store_true",
+                   help="Write decoded.mp4, annotated.mp4, server_metrics.csv, "
+                        "server_config.json under --output-dir.")
+    p.add_argument("--output-dir", dest="output_dir", default=None,
+                   help="Output directory for server-side artifacts.")
 
     cli = p.parse_args()
 
@@ -177,10 +602,52 @@ def _parse_args() -> argparse.Namespace:
         raise SystemExit(f"Missing server_h264 section in config: {cli.config}")
 
     args = argparse.Namespace(**block)
-    if cli.port is not None:
-        args.port = int(cli.port)
+    # Backfill defaults so older config files without these keys still work.
+    args.host = getattr(args, "host", None) or "0.0.0.0"
+    args.save_artifacts = bool(getattr(args, "save_artifacts", False))
+    args.output_dir = getattr(args, "output_dir", None)
+    args.heatmap_padding_min_pct = float(
+        getattr(args, "heatmap_padding_min_pct", 0.08)
+    )
+    args.heatmap_padding_max_pct = float(
+        getattr(args, "heatmap_padding_max_pct", 0.50)
+    )
+    args.heatmap_padding_small_area_ratio = float(
+        getattr(args, "heatmap_padding_small_area_ratio", 0.01)
+    )
+    args.heatmap_padding_large_area_ratio = float(
+        getattr(args, "heatmap_padding_large_area_ratio", 0.20)
+    )
+
+    overrides = {
+        "model": cli.model,
+        "classes": cli.classes,
+        "device": cli.device,
+        "conf_threshold": cli.conf_threshold,
+        "nms_iou": cli.nms_iou,
+        "tracker": cli.tracker,
+        "host": cli.host,
+        "port": cli.port,
+        "width": cli.width,
+        "height": cli.height,
+        "heatmap_padding_min_pct": cli.heatmap_padding_min_pct,
+        "heatmap_padding_max_pct": cli.heatmap_padding_max_pct,
+        "heatmap_padding_small_area_ratio": cli.heatmap_padding_small_area_ratio,
+        "heatmap_padding_large_area_ratio": cli.heatmap_padding_large_area_ratio,
+        "output_dir": cli.output_dir,
+    }
+    for key, value in overrides.items():
+        if value is not None:
+            setattr(args, key, value)
     if cli.show_window:
         args.show_window = True
+    if cli.save_artifacts:
+        args.save_artifacts = True
+
+    if args.save_artifacts and not args.output_dir:
+        args.output_dir = str(
+            Path("runs") / time.strftime("server_%Y%m%d_%H%M%S")
+        )
     return args
 
 
@@ -219,15 +686,24 @@ def main():
     except Exception as e:
         log.warning("detector warmup skipped: %s", e)
 
+    bind_host = getattr(args, "host", None) or "0.0.0.0"
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind(("0.0.0.0", args.port))
+    server_socket.bind((bind_host, args.port))
     server_socket.listen(1)
     log.info(
-        "listening on 0.0.0.0:%d model=%s classes=%s device=%s",
-        args.port, args.model, classes, detector.device,
+        "listening on %s:%d model=%s classes=%s device=%s",
+        bind_host, args.port, args.model, classes, detector.device,
+    )
+    log.info(
+        "heatmap padding min=%.2f max=%.2f small_area=%.3f large_area=%.3f",
+        args.heatmap_padding_min_pct,
+        args.heatmap_padding_max_pct,
+        args.heatmap_padding_small_area_ratio,
+        args.heatmap_padding_large_area_ratio,
     )
 
+    artifacts: Optional[ServerArtifacts] = None
     conn = None
     worker_thread = None
     stop_event = threading.Event()
@@ -241,7 +717,36 @@ def main():
         frame_duration_ms = int(1000 / fps)
         log.info("FPS handshake received: %.2f  frame_duration_ms=%d", fps, frame_duration_ms)
 
-        result_q = queue.Queue(maxsize=int(max(fps, 1) * 3))
+        if getattr(args, "save_artifacts", False):
+            artifacts = ServerArtifacts(
+                output_dir=args.output_dir,
+                width=args.width,
+                height=args.height,
+                fps=fps,
+                enabled=True,
+            )
+            artifacts.write_session_config({
+                "model": args.model,
+                "classes": classes,
+                "device": detector.device,
+                "conf_threshold": args.conf_threshold,
+                "nms_iou": args.nms_iou,
+                "tracker": args.tracker,
+                "host": bind_host,
+                "port": args.port,
+                "width": args.width,
+                "height": args.height,
+                "fps": fps,
+                "heatmap_padding_min_pct": args.heatmap_padding_min_pct,
+                "heatmap_padding_max_pct": args.heatmap_padding_max_pct,
+                "heatmap_padding_small_area_ratio": args.heatmap_padding_small_area_ratio,
+                "heatmap_padding_large_area_ratio": args.heatmap_padding_large_area_ratio,
+                "client_addr": f"{addr[0]}:{addr[1]}",
+                "start_wall_time": time.time(),
+            })
+
+        stop_event = threading.Event()
+        result_q = queue.Queue(maxsize=int(fps * 3))
 
         fps_counter = 0
         fps_timer = time.time()
@@ -268,19 +773,33 @@ def main():
                         continue
 
                     frame_confs = []
-                    latest_heatmap = None
                     latest_boxes_for_wire = []
                     heat_w, heat_h = detector.heatmap_size
+                    segment_heatmap = np.zeros((heat_h, heat_w), dtype=np.uint8)
+                    frame_count = len(frames)
 
-                    for frame in frames:
+                    for frame_index, frame in enumerate(frames):
                         conf, _heatmap, detections, _infer_us = detector.infer(frame)
                         boxes_for_wire = person_boxes_for_wire(detector, detections, person_cls_idx)
                         if boxes_for_wire:
                             conf = float(min(b[4] for b in boxes_for_wire))
+                            latest_boxes_for_wire = boxes_for_wire
 
                         frame_confs.append(float(conf))
-                        latest_boxes_for_wire = boxes_for_wire
-                        latest_heatmap = boxes_to_heatmap(boxes_for_wire, frame.shape, heat_w, heat_h)
+                        add_boxes_to_heatmap(
+                            segment_heatmap,
+                            boxes_for_wire,
+                            frame.shape,
+                            recency_heat_value(frame_index, frame_count),
+                            padding_min_pct=args.heatmap_padding_min_pct,
+                            padding_max_pct=args.heatmap_padding_max_pct,
+                            padding_small_area_ratio=(
+                                args.heatmap_padding_small_area_ratio
+                            ),
+                            padding_large_area_ratio=(
+                                args.heatmap_padding_large_area_ratio
+                            ),
+                        )
 
                         if args.show_window:
                             if result_q.full():
@@ -293,14 +812,12 @@ def main():
                             except queue.Full:
                                 pass
 
-                    segment_conf = float(np.percentile(np.array(frame_confs, dtype=np.float32), 10))
-                    if latest_heatmap is None:
-                        latest_heatmap = np.zeros((heat_h, heat_w), dtype=np.uint8)
+                    segment_conf = float(np.percentile(np.array(frame_confs, dtype=np.float32), 50))
                     send_segment_feedback(
                         conn,
                         segment_id,
                         segment_conf,
-                        latest_heatmap,
+                        segment_heatmap,
                         latest_boxes_for_wire,
                     )
                 except (BrokenPipeError, ConnectionError, OSError, struct.error) as e:
@@ -364,6 +881,8 @@ def main():
                 pass
         server_socket.close()
         cv2.destroyAllWindows()
+        if artifacts is not None:
+            artifacts.close()
         log.info("server shutdown complete.")
 
 
