@@ -1,0 +1,31 @@
+2026-05-29 14:39:48,694 [INFO] echostream.camera: sent FPS handshake to server: 15.00
+2026-05-29 14:39:48,695 [INFO] echostream.camera: SegmentEncoder init width=640 height=480 fps=15.00 gop=5 baseline=False
+2026-05-29 14:39:48,695 [INFO] echostream.camera: SegmentEncoder init width=640 height=480 fps=15.00 gop=5 baseline=True
+2026-05-29 14:39:48,695 [INFO] echostream.camera: EMA-probe adaptive CRF: target=0.70 margin=0.030 alpha=0.30 up=1 down=2 probe_interval=3 range=[23,43]
+2026-05-29 14:39:48,700 [INFO] echostream.artifacts: session artifacts → /Users/ninjadare/Desktop/ss_runs (async writer active)
+2026-05-29 14:39:48,701 [INFO] echostream.camera: baseline metrics → /Users/ninjadare/Desktop/ss_runs/baseline_metrics.csv
+2026-05-29 14:39:48,701 [INFO] echostream.camera: ready input=webcam:0 classes=['person'] preview=OFF artifacts=/Users/ninjadare/Desktop/ss_runs
+2026-05-29 14:39:58,775 [INFO] echostream.camera: [BW] sent=1.74MB saved=52.4% vs per-frame JPEG estimator
+2026-05-29 14:39:58,776 [INFO] echostream.camera: [BW_BASE] sent=2.34MB (full-frame fixed CRF=23)
+2026-05-29 14:39:58,776 [INFO] echostream.camera: [BW_DELTA] EchoStream=1.74MB vs Baseline=2.34MB → saved=25.6% vs baseline H.264
+2026-05-29 14:39:58,777 [INFO] echostream.camera: [CONF] avg_raw=0.666 p10=0.565 p50=0.697 p90=0.710 lt0.5=3.8% | avg_masked=0.632 p10=0.476 p50=0.690 p90=0.717 lt0.5=11.5% | keep=0.95 samples(raw=26 masked=26)
+2026-05-29 14:40:08,800 [INFO] echostream.camera: [BW] sent=1.50MB saved=61.1% vs per-frame JPEG estimator
+2026-05-29 14:40:08,800 [INFO] echostream.camera: [BW_BASE] sent=2.32MB (full-frame fixed CRF=23)
+2026-05-29 14:40:08,800 [INFO] echostream.camera: [BW_DELTA] EchoStream=1.50MB vs Baseline=2.32MB → saved=35.5% vs baseline H.264
+2026-05-29 14:40:08,801 [INFO] echostream.camera: [CONF] avg_raw=0.637 p10=0.321 p50=0.697 p90=0.718 lt0.5=14.8% | avg_masked=0.660 p10=0.500 p50=0.693 p90=0.718 lt0.5=5.6% | keep=1.04 samples(raw=54 masked=54)
+2026-05-29 14:40:18,869 [INFO] echostream.camera: [BW] sent=1.85MB saved=50.9% vs per-frame JPEG estimator
+2026-05-29 14:40:18,870 [INFO] echostream.camera: [BW_BASE] sent=2.47MB (full-frame fixed CRF=23)
+2026-05-29 14:40:18,870 [INFO] echostream.camera: [BW_DELTA] EchoStream=1.85MB vs Baseline=2.47MB → saved=25.0% vs baseline H.264
+2026-05-29 14:40:18,871 [INFO] echostream.camera: [CONF] avg_raw=0.650 p10=0.337 p50=0.699 p90=0.719 lt0.5=12.2% | avg_masked=0.671 p10=0.605 p50=0.699 p90=0.720 lt0.5=3.7% | keep=1.03 samples(raw=82 masked=82)
+2026-05-29 14:40:28,881 [INFO] echostream.camera: [BW] sent=1.65MB saved=51.0% vs per-frame JPEG estimator
+2026-05-29 14:40:28,881 [INFO] echostream.camera: [BW_BASE] sent=3.02MB (full-frame fixed CRF=23)
+2026-05-29 14:40:28,881 [INFO] echostream.camera: [BW_DELTA] EchoStream=1.65MB vs Baseline=3.02MB → saved=45.4% vs baseline H.264
+2026-05-29 14:40:28,882 [INFO] echostream.camera: [CONF] avg_raw=0.668 p10=0.541 p50=0.705 p90=0.728 lt0.5=9.2% | avg_masked=0.674 p10=0.600 p50=0.701 p90=0.730 lt0.5=4.6% | keep=1.01 samples(raw=109 masked=108)
+2026-05-29 14:40:38,961 [INFO] echostream.camera: [BW] sent=1.67MB saved=53.5% vs per-frame JPEG estimator
+2026-05-29 14:40:38,962 [INFO] echostream.camera: [BW_BASE] sent=2.67MB (full-frame fixed CRF=23)
+2026-05-29 14:40:38,962 [INFO] echostream.camera: [BW_DELTA] EchoStream=1.67MB vs Baseline=2.67MB → saved=37.3% vs baseline H.264
+2026-05-29 14:40:38,963 [INFO] echostream.camera: [CONF] avg_raw=0.675 p10=0.613 p50=0.704 p90=0.727 lt0.5=7.3% | avg_masked=0.678 p10=0.613 p50=0.702 p90=0.727 lt0.5=3.6% | keep=1.00 samples(raw=137 masked=137)
+2026-05-29 14:40:49,031 [INFO] echostream.camera: [BW] sent=2.10MB saved=46.2% vs per-frame JPEG estimator
+2026-05-29 14:40:49,032 [INFO] echostream.camera: [BW_BASE] sent=2.56MB (full-frame fixed CRF=23)
+2026-05-29 14:40:49,032 [INFO] echostream.camera: [BW_DELTA] EchoStream=2.10MB vs Baseline=2.56MB → saved=18.0% vs baseline H.264
+2026-05-29 14:40:49,034 [INFO] echostream.camera: [CONF] avg_raw=0.671 p10=0.613 p50=0.698 p90=0.725 lt0.5=6.1% | avg_masked=0.675 p10=0.617 p50=0.698 p90=0.725 lt0.5=3.0% | keep=1.01 samples(raw=165 masked=165)

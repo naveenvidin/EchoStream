@@ -592,6 +592,8 @@ def _parse_args() -> argparse.Namespace:
                         "server_config.json under --output-dir.")
     p.add_argument("--output-dir", dest="output_dir", default=None,
                    help="Output directory for server-side artifacts.")
+    p.add_argument("--relay-port", dest="relay_port", type=int, default=None,
+                   help="If set, stream annotated frames to the UI on this local port.")
 
     cli = p.parse_args()
 
@@ -606,6 +608,7 @@ def _parse_args() -> argparse.Namespace:
     args.host = getattr(args, "host", None) or "0.0.0.0"
     args.save_artifacts = bool(getattr(args, "save_artifacts", False))
     args.output_dir = getattr(args, "output_dir", None)
+    args.relay_port = getattr(args, "relay_port", None)
     args.heatmap_padding_min_pct = float(
         getattr(args, "heatmap_padding_min_pct", 0.08)
     )
@@ -635,6 +638,7 @@ def _parse_args() -> argparse.Namespace:
         "heatmap_padding_small_area_ratio": cli.heatmap_padding_small_area_ratio,
         "heatmap_padding_large_area_ratio": cli.heatmap_padding_large_area_ratio,
         "output_dir": cli.output_dir,
+        "relay_port": cli.relay_port,
     }
     for key, value in overrides.items():
         if value is not None:
@@ -708,6 +712,13 @@ def main():
     worker_thread = None
     stop_event = threading.Event()
     try:
+        from src.ui.frame_relay import FrameRelayServer
+        relay: Optional[FrameRelayServer] = None
+        if getattr(args, "relay_port", None):
+            relay = FrameRelayServer(
+                port=args.relay_port, width=args.width, height=args.height
+            )
+            relay.start()
         conn, addr = server_socket.accept()
         log.info("connection from %s", addr)
 
@@ -801,16 +812,16 @@ def main():
                             ),
                         )
 
-                        if args.show_window:
-                            if result_q.full():
-                                try:
-                                    result_q.get_nowait()
-                                except queue.Empty:
-                                    pass
+                        
+                        if result_q.full():
                             try:
-                                result_q.put_nowait((frame, conf, boxes_for_wire))
-                            except queue.Full:
+                                result_q.get_nowait()
+                            except queue.Empty:
                                 pass
+                        try:
+                            result_q.put_nowait((frame, conf, boxes_for_wire))
+                        except queue.Full:
+                            pass
 
                     segment_conf = float(np.percentile(np.array(frame_confs, dtype=np.float32), 50))
                     send_segment_feedback(
@@ -828,45 +839,47 @@ def main():
         worker_thread = threading.Thread(target=process_segments, daemon=True)
         worker_thread.start()
 
-        if args.show_window:
-            while not stop_event.is_set():
-                try:
-                    frame, conf, boxes_for_wire = result_q.get(timeout=0.1)
-                except queue.Empty:
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        stop_event.set()
-                        break
-                    continue
+        # REPLACE the if args.show_window / else block with:
+        while not stop_event.is_set():
+            try:
+                frame, conf, boxes_for_wire = result_q.get(timeout=0.1)
+            except queue.Empty:
+                if args.show_window and cv2.waitKey(1) & 0xFF == ord("q"):
+                    stop_event.set()
+                if not args.show_window and not worker_thread.is_alive():
+                    break
+                continue
 
-                fps_counter += 1
-                if time.time() - fps_timer >= 1.0:
-                    current_fps = fps_counter / max(time.time() - fps_timer, 1e-6)
-                    fps_counter = 0
-                    fps_timer = time.time()
+            fps_counter += 1
+            if time.time() - fps_timer >= 1.0:
+                current_fps = fps_counter / max(time.time() - fps_timer, 1e-6)
+                fps_counter = 0
+                fps_timer = time.time()
 
-                annotated = frame.copy()
-                tracked_dets = []
-                tracked_names = detector.class_names
-                if person_cls_idx is not None:
-                    for x1, y1, x2, y2, c in boxes_for_wire:
-                        tracked_dets.append((x1, y1, x2, y2, float(c), int(person_cls_idx)))
-                draw_hud(
-                    annotated,
-                    "Edge Server - YOLO-World",
-                    conf,
-                    tracked_dets,
-                    tracked_names,
-                    current_fps,
-                )
+            annotated = frame.copy()
+            tracked_dets = []
+            tracked_names = detector.class_names
+            if person_cls_idx is not None:
+                for x1, y1, x2, y2, c in boxes_for_wire:
+                    tracked_dets.append((x1, y1, x2, y2, float(c), int(person_cls_idx)))
+            draw_hud(
+                annotated,
+                "Edge Server - YOLO-World",
+                conf,
+                tracked_dets,
+                tracked_names,
+                current_fps,
+            )
+
+            # Send to UI relay if active (non-blocking, drops if UI can't keep up)
+            if relay is not None:
+                relay.send(annotated)
+
+            if args.show_window:
                 cv2.imshow("Edge Server - YOLO-World", annotated)
-
-                # Pace display to the negotiated FPS without slowing segment feedback.
                 if cv2.waitKey(frame_duration_ms) & 0xFF == ord("q"):
                     stop_event.set()
                     break
-        else:
-            while not stop_event.is_set() and worker_thread.is_alive():
-                worker_thread.join(timeout=0.5)
 
     except Exception as e:
         log.warning("server error: %s", e)
@@ -881,6 +894,8 @@ def main():
                 pass
         server_socket.close()
         cv2.destroyAllWindows()
+        if relay is not None:
+            relay.stop()
         if artifacts is not None:
             artifacts.close()
         log.info("server shutdown complete.")
