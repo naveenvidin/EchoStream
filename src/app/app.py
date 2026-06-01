@@ -351,7 +351,6 @@ class ConfigScreen(tk.Frame):
         if not classes:
             messagebox.showerror("Validation", "Detection prompt cannot be empty.")
             return
-
         if self._source_var.get() == "file":
             file_path = self._file_path_var.get().strip()
             if not file_path:
