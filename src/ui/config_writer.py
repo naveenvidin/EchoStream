@@ -34,6 +34,7 @@ def write_runtime_config(
     baseline_enabled: bool,
     save_artifacts: bool,
     output_dir: str | None,
+    model: str | None = None,
 ) -> Path:
     """Merge UI values into a copy of default.json and write to a temp file.
 
@@ -52,12 +53,15 @@ def write_runtime_config(
     # Resolve output dir — default to runs/<timestamp> if blank or None.
     if save_artifacts and not output_dir:
         output_dir = str(Path("runs") / time.strftime("session_%Y%m%d_%H%M%S"))
+    model = (model or "").strip() or None
 
     # --- camera_h264 overrides ---
     cam = config.setdefault("camera_h264", {})
     cam["input"] = input_source
     cam["loop_video"] = loop_video
     cam["classes"] = classes
+    if model is not None:
+        cam["model"] = model
     cam["baseline_enabled"] = baseline_enabled
     cam["save_artifacts"] = save_artifacts
     cam["output_dir"] = output_dir if save_artifacts else None
@@ -65,6 +69,8 @@ def write_runtime_config(
     # --- server_h264 overrides (both adaptive and baseline share same config) ---
     srv = config.setdefault("server_h264", {})
     srv["classes"] = classes
+    if model is not None:
+        srv["model"] = model
     srv["save_artifacts"] = save_artifacts
     srv["output_dir"] = output_dir if save_artifacts else None
     # Never open cv2 windows when launched from the UI.

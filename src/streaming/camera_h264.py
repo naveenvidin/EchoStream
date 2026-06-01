@@ -455,6 +455,7 @@ def main():
     from src.inference.detection import parse_classes
 
     classes = parse_classes(args.classes) or ["object"]
+    detection_label = classes[0] if len(classes) == 1 else "target"
     cap, input_source, probed_fps = _open_input(args.input, args.width, args.height)
     fps = float(probed_fps)
     gop = fps//3 if fps >= 3 else 1 # SO IMPORTANT LIKE SO IMPORTANT
@@ -685,7 +686,7 @@ def main():
                             cv2.rectangle(raw_panel, p1, p2, (255, 255, 0), 2)
                             cv2.putText(
                                 raw_panel,
-                                f"person {c:.2f}",
+                                f"{detection_label} {c:.2f}",
                                 (p1[0], max(0, p1[1] - 8)),
                                 cv2.FONT_HERSHEY_SIMPLEX,
                                 0.5,
@@ -707,7 +708,7 @@ def main():
                             cv2.rectangle(masked_panel, p1, p2, (0, 255, 255), 2)
                             cv2.putText(
                                 masked_panel,
-                                f"person {c:.2f}",
+                                f"{detection_label} {c:.2f}",
                                 (p1[0], max(0, p1[1] - 8)),
                                 cv2.FONT_HERSHEY_SIMPLEX,
                                 0.5,

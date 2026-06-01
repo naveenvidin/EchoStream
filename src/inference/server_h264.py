@@ -394,27 +394,45 @@ def inference_loop(decoder, detector, conn, result_q, stop_event,
         else:
             person_cls_idx = None
 
-def person_boxes_for_wire(detector, detections, person_cls_idx):
-    person_dets = []
-    if person_cls_idx is not None:
-        for x1, y1, x2, y2, c, cls_idx in detections:
-            if cls_idx != person_cls_idx:
-                continue
-            box = np.array([x1, y1, x2, y2], dtype=np.float32)
-            person_dets.append((box, float(c)))
+def boxes_for_feedback(detector, detections, person_cls_idx):
+    """Convert detector outputs into feedback boxes and display detections.
 
-    boxes_for_wire: list[tuple[float, float, float, float, float]] = []
+    The wire protocol currently carries only x1/y1/x2/y2/conf, so class ids
+    stay in the server-side display detections. Person prompts keep using the
+    existing tracker; all other prompts flow through directly.
+    """
     tracker = getattr(detector, "_echostream_tracker", None)
-    if tracker is None:
-        for box, c in person_dets:
-            x1, y1, x2, y2 = box.tolist()
-            boxes_for_wire.append((float(x1), float(y1), float(x2), float(y2), float(c)))
-    else:
+    boxes_for_wire: list[tuple[float, float, float, float, float]] = []
+    display_dets: list[tuple[float, float, float, float, float, int]] = []
+
+    if tracker is not None and person_cls_idx is not None:
+        person_dets = []
+        other_dets = []
+        for x1, y1, x2, y2, c, cls_idx in detections:
+            if int(cls_idx) == int(person_cls_idx):
+                box = np.array([x1, y1, x2, y2], dtype=np.float32)
+                person_dets.append((box, float(c)))
+            else:
+                other_dets.append((x1, y1, x2, y2, c, cls_idx))
+
         tracks = tracker.update(person_dets)
         for t in tracks:
             x1, y1, x2, y2 = t.bbox_xyxy.tolist()
-            boxes_for_wire.append((float(x1), float(y1), float(x2), float(y2), float(t.conf)))
-    return boxes_for_wire
+            box = (float(x1), float(y1), float(x2), float(y2), float(t.conf))
+            boxes_for_wire.append(box)
+            display_dets.append((*box, int(person_cls_idx)))
+
+        for x1, y1, x2, y2, c, cls_idx in other_dets:
+            box = (float(x1), float(y1), float(x2), float(y2), float(c))
+            boxes_for_wire.append(box)
+            display_dets.append((*box, int(cls_idx)))
+        return boxes_for_wire, display_dets
+
+    for x1, y1, x2, y2, c, cls_idx in detections:
+        box = (float(x1), float(y1), float(x2), float(y2), float(c))
+        boxes_for_wire.append(box)
+        display_dets.append((*box, int(cls_idx)))
+    return boxes_for_wire, display_dets
 
 
 def recency_heat_value(frame_index: int, frame_count: int) -> int:
@@ -791,7 +809,11 @@ def main():
 
                     for frame_index, frame in enumerate(frames):
                         conf, _heatmap, detections, _infer_us = detector.infer(frame)
-                        boxes_for_wire = person_boxes_for_wire(detector, detections, person_cls_idx)
+                        boxes_for_wire, display_dets = boxes_for_feedback(
+                            detector,
+                            detections,
+                            person_cls_idx,
+                        )
                         if boxes_for_wire:
                             conf = float(min(b[4] for b in boxes_for_wire))
                             latest_boxes_for_wire = boxes_for_wire
@@ -819,7 +841,7 @@ def main():
                             except queue.Empty:
                                 pass
                         try:
-                            result_q.put_nowait((frame, conf, boxes_for_wire))
+                            result_q.put_nowait((frame, conf, display_dets))
                         except queue.Full:
                             pass
 
@@ -842,7 +864,7 @@ def main():
         # REPLACE the if args.show_window / else block with:
         while not stop_event.is_set():
             try:
-                frame, conf, boxes_for_wire = result_q.get(timeout=0.1)
+                frame, conf, display_dets = result_q.get(timeout=0.1)
             except queue.Empty:
                 if args.show_window and cv2.waitKey(1) & 0xFF == ord("q"):
                     stop_event.set()
@@ -857,17 +879,12 @@ def main():
                 fps_timer = time.time()
 
             annotated = frame.copy()
-            tracked_dets = []
-            tracked_names = detector.class_names
-            if person_cls_idx is not None:
-                for x1, y1, x2, y2, c in boxes_for_wire:
-                    tracked_dets.append((x1, y1, x2, y2, float(c), int(person_cls_idx)))
             draw_hud(
                 annotated,
                 "Edge Server - YOLO-World",
                 conf,
-                tracked_dets,
-                tracked_names,
+                display_dets,
+                detector.class_names,
                 current_fps,
             )
 
