@@ -27,10 +27,26 @@ FIXED_CRF = None
 WIDTH, HEIGHT = 640, 480
 LOG_BANDWIDTH_EVERY_SEC = 10.0
 INITIAL_CRF = 30
+BLUR_LEVELS = {
+    "low": {"blur_kernel_size": 5, "low_blur_kernel_size": 9},
+    "high": {"blur_kernel_size": 21, "low_blur_kernel_size": 51},
+}
 
 log = logging.getLogger("echostream.camera")
 
 SHOW_YOLO_BOXES = True
+
+
+def _blur_settings(level: str) -> tuple[str, dict[str, int]]:
+    normalized = str(level or "high").strip().lower()
+    if normalized not in BLUR_LEVELS:
+        log.warning(
+            "unknown mask_blur_level=%r; using high. Expected one of: %s",
+            level,
+            ", ".join(sorted(BLUR_LEVELS)),
+        )
+        normalized = "high"
+    return normalized, BLUR_LEVELS[normalized]
 
 
 class SegmentEncoder:
@@ -403,6 +419,10 @@ def _parse_args() -> argparse.Namespace:
                    help="Override response timeout (seconds).")
     p.add_argument("--no-preview", action="store_true",
                    help="Override no_preview=true (headless).")
+    p.add_argument("--mask-blur-level", dest="mask_blur_level",
+                   choices=sorted(BLUR_LEVELS),
+                   default=None,
+                   help="Override mask blur strength: low or high.")
 
     cli = p.parse_args()
 
@@ -428,6 +448,7 @@ def _parse_args() -> argparse.Namespace:
         "record_input_max_frames": cli.record_input_max_frames,
         "max_frames": cli.max_frames,
         "response_timeout_sec": cli.response_timeout_sec,
+        "mask_blur_level": cli.mask_blur_level,
     }
     for key, value in overrides.items():
         if value is not None:
@@ -482,7 +503,20 @@ def main():
 
     # -----set up shared state and background threads-----
     counters = PipelineCounters(expected_fps=fps)
-    masker = OpticalFlowMasker(motion_threshold=3.0, min_contour_area=1200)
+    blur_level, blur_kwargs = _blur_settings(
+        getattr(args, "mask_blur_level", "high"),
+    )
+    log.info(
+        "mask blur level=%s mid_kernel=%d low_kernel=%d",
+        blur_level,
+        blur_kwargs["blur_kernel_size"],
+        blur_kwargs["low_blur_kernel_size"],
+    )
+    masker = OpticalFlowMasker(
+        motion_threshold=3.0,
+        min_contour_area=1200,
+        **blur_kwargs,
+    )
     encoder = SegmentEncoder(width=args.width, height=args.height, fps=fps, gop=int(gop))
     baseline_encoder = SegmentEncoder(width=args.width, height=args.height, fps=fps, gop=int(gop), baseline=True)
     controller_type = str(getattr(args, "controller_type", "ema_probe")).lower()
