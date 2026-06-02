@@ -2,7 +2,7 @@
   "_comment": "GPU/inference side. Listens on 0.0.0.0:port for the camera connection. show_window=false by default for headless deployment; flip on for local debugging. All inference/feedback logic is identical to default.json.",
   "server_h264": {
     "tracker": "kalman",
-    "model": "yolov8s-world.pt",
+    "model": "yolov8m-worldv2.pt",
     "classes": "person",
     "device": "auto",
     "conf_threshold": 0.3,
