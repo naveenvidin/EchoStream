@@ -9,6 +9,7 @@
     "nms_iou": 0.45,
     "host": "0.0.0.0",
     "port": 9999,
+    "transport": "udp",
     "width": 640,
     "height": 480,
     "show_window": false,

@@ -11,7 +11,9 @@ Launch with:
 """
 from __future__ import annotations
 
+import json
 import queue
+import signal
 import socket
 import struct
 import subprocess
@@ -545,6 +547,14 @@ class App:
                 output_dir=output_dir,
             )
             self._runtime_config = config_path
+            if save_artifacts:
+                with open(config_path, "r") as f:
+                    runtime_config = json.load(f)
+                resolved_output_dir = (
+                    runtime_config.get("camera_h264", {}).get("output_dir")
+                    or runtime_config.get("server_h264", {}).get("output_dir")
+                )
+                output_dir = str(resolved_output_dir) if resolved_output_dir else output_dir
         except Exception as e:
             messagebox.showerror("Config error", str(e))
             return
@@ -608,18 +618,25 @@ class App:
         self._show_running_screen(baseline_enabled, save_artifacts, output_dir)
 
     def _on_stop(self):
-        """Terminate all subprocesses and return to config screen."""
+        """Gracefully stop subprocesses so MP4 artifacts are finalized."""
         for proc in self._procs:
             try:
-                proc.terminate()
+                proc.send_signal(signal.SIGINT)
             except OSError:
                 pass
         # Give them a moment to exit cleanly
         for proc in self._procs:
             try:
-                proc.wait(timeout=3.0)
+                proc.wait(timeout=15.0)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=3.0)
+                except (OSError, subprocess.TimeoutExpired):
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
         self._procs.clear()
 
         if self._runtime_config and self._runtime_config.exists():

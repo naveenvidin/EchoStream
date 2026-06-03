@@ -19,6 +19,7 @@ import numpy as np
 
 from src.optical_flow.motion_masker import OpticalFlowMasker
 from src.streaming.crf_controller import DiscreteStepCrfController, EmaProbeCrfController
+from src.streaming.udp_transport import MAX_UDP_PACKET, UdpSegmentSender
 
 
 SERVER_IP = "localhost"
@@ -279,6 +280,73 @@ class ConfidenceListener:
             return int(self._responses)
 
 
+class UdpConfidenceListener(ConfidenceListener):
+    def _listen(self):
+        while not self._stop.is_set():
+            try:
+                packet = self.sock.recv(MAX_UDP_PACKET)
+                if len(packet) < 14:
+                    continue
+                segment_id, conf, heat_w, heat_h, num_boxes = struct.unpack_from(
+                    "!IfHHH", packet, 0,
+                )
+                if not np.isfinite(conf):
+                    if self.counters is not None:
+                        self.counters.record_invalid_response()
+                    continue
+                conf = max(0.0, min(1.0, conf))
+                segment_id = int(segment_id)
+                heat_w = int(heat_w)
+                heat_h = int(heat_h)
+                num_boxes = int(num_boxes)
+
+                offset = 14
+                heat_size = heat_w * heat_h
+                heat_bytes = packet[offset:offset + heat_size] if heat_w and heat_h else b""
+                offset += heat_size
+                heatmap = None
+                if heat_bytes and len(heat_bytes) == heat_size:
+                    heatmap = (
+                        np.frombuffer(heat_bytes, dtype=np.uint8)
+                        .reshape((heat_h, heat_w))
+                        .astype(np.float32) / 255.0
+                    )
+
+                boxes = []
+                box_size = num_boxes * 20
+                box_bytes = packet[offset:offset + box_size]
+                if len(box_bytes) == box_size:
+                    for i in range(num_boxes):
+                        off = i * 20
+                        x1, y1, x2, y2, c = struct.unpack("!fffff", box_bytes[off:off + 20])
+                        boxes.append((x1, y1, x2, y2, c))
+
+                new_crf = self._controller.update(conf)
+                event_to_set = None
+                with self._lock:
+                    frame_count = self._pending_segments.pop(segment_id, None)
+                    self._segment_confidences[segment_id] = conf
+                    if len(self._segment_confidences) > self._SEGMENT_MEMORY:
+                        oldest = min(self._segment_confidences)
+                        self._segment_confidences.pop(oldest, None)
+                    self._latest_conf = conf
+                    self._latest_segment_id = int(segment_id)
+                    self._next_crf = new_crf
+                    self._latest_heatmap = heatmap
+                    self._latest_boxes = boxes
+                    self._responses += 1
+                    event_to_set = self._segment_events.pop(segment_id, None)
+                if event_to_set is not None:
+                    event_to_set.set()
+                if self.counters is not None:
+                    if frame_count is None:
+                        self.counters.record_stale_response()
+                    else:
+                        self.counters.record_response_received(frame_count)
+            except (ConnectionError, struct.error, OSError):
+                break
+
+
 def _recv_exact(sock: socket.socket, size: int) -> bytes:
     chunks, received = [], 0
     while received < size:
@@ -388,6 +456,8 @@ def _parse_args() -> argparse.Namespace:
                    help="Override GPU server IP / hostname.")
     p.add_argument("--port", type=int, default=None,
                    help="Override server port.")
+    p.add_argument("--transport", choices=("tcp", "udp"), default=None,
+                   help="Override stream transport.")
     p.add_argument("--width", type=int, default=None,
                    help="Override capture/encode width.")
     p.add_argument("--height", type=int, default=None,
@@ -438,6 +508,7 @@ def _parse_args() -> argparse.Namespace:
         "input": cli.input,
         "server_ip": cli.server_ip,
         "port": cli.port,
+        "transport": cli.transport,
         "width": cli.width,
         "height": cli.height,
         "classes": cli.classes,
@@ -480,26 +551,44 @@ def main():
     cap, input_source, probed_fps = _open_input(args.input, args.width, args.height)
     fps = float(probed_fps)
     gop = fps//3 if fps >= 3 else 1 # SO IMPORTANT LIKE SO IMPORTANT
+    transport = str(getattr(args, "transport", "tcp") or "tcp").lower()
+    if transport not in ("tcp", "udp"):
+        log.warning("unknown transport=%r; using tcp", transport)
+        transport = "tcp"
 
     # The "masked" socket carries the adaptive ROI-masked stream; this is the
     # original (and only) connection in the previous pipeline.
-    masked_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    masked_socket.connect((args.server_ip, args.port))
+    masked_udp = None
+    if transport == "udp":
+        masked_udp = UdpSegmentSender(args.server_ip, args.port)
+        masked_socket = masked_udp.sock
+    else:
+        masked_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        masked_socket.connect((args.server_ip, args.port))
 
     # Send the camera's actual FPS to the server immediately after connecting,
     # so the server can set its own FRAME_DURATION without relying on a hardcoded constant.
-    masked_socket.sendall(struct.pack("!f", fps))
-    log.info("sent FPS handshake to server: %.2f", fps)
+    if masked_udp is not None:
+        masked_udp.send_fps(fps)
+    else:
+        masked_socket.sendall(struct.pack("!f", fps))
+    log.info("sent FPS handshake to server: %.2f transport=%s", fps, transport)
 
     # Optional parallel "baseline" stream: a full-frame fixed-CRF copy sent to a
     # second server instance for A/B comparison against the masked stream.
     baseline_enabled = bool(getattr(args, "baseline_enabled", False))
     baseline_socket = None
+    baseline_udp = None
     if baseline_enabled:
         baseline_port = int(getattr(args, "baseline_port", args.port))
-        baseline_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        baseline_socket.connect((args.server_ip, baseline_port))
-        baseline_socket.sendall(struct.pack("!f", fps))
+        if transport == "udp":
+            baseline_udp = UdpSegmentSender(args.server_ip, baseline_port)
+            baseline_socket = baseline_udp.sock
+            baseline_udp.send_fps(fps)
+        else:
+            baseline_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            baseline_socket.connect((args.server_ip, baseline_port))
+            baseline_socket.sendall(struct.pack("!f", fps))
 
     # -----set up shared state and background threads-----
     counters = PipelineCounters(expected_fps=fps)
@@ -568,10 +657,11 @@ def main():
             "levels": list(getattr(controller, "LEVELS", [])),
         }
 
-    listener = ConfidenceListener(sock=masked_socket, controller=controller, counters=counters)
+    listener_cls = UdpConfidenceListener if transport == "udp" else ConfidenceListener
+    listener = listener_cls(sock=masked_socket, controller=controller, counters=counters)
     baseline_listener = None
     if baseline_socket is not None:
-        baseline_listener = ConfidenceListener(sock=baseline_socket, controller=_build_controller(), counters=None)
+        baseline_listener = listener_cls(sock=baseline_socket, controller=_build_controller(), counters=None)
 
     run_dir = args.output_dir
     if args.save_artifacts and not run_dir:
@@ -783,7 +873,10 @@ def main():
             header = struct.pack("!II", int(segment_id), len(data))
             listener.expect_segment(segment_id, len(segment_items))
             t_send = time.perf_counter()
-            masked_socket.sendall(header + data)
+            if masked_udp is not None:
+                masked_udp.send_segment(segment_id, data)
+            else:
+                masked_socket.sendall(header + data)
             send_ms = (time.perf_counter() - t_send) * 1000.0
 
             with shared_lock:
@@ -868,7 +961,10 @@ def main():
             header = struct.pack("!II", int(segment_id), len(data))
             if baseline_listener is not None:
                 baseline_listener.expect_segment(segment_id, len(segment_items))
-            baseline_socket.sendall(header + data)
+            if baseline_udp is not None:
+                baseline_udp.send_segment(segment_id, data)
+            else:
+                baseline_socket.sendall(header + data)
             with shared_lock:
                 last_baseline_sent_kb["kb"] = len(data) / 1024
                 last_baseline_crf["crf"] = crf

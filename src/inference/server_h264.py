@@ -35,6 +35,8 @@ from typing import Optional
 import cv2
 import numpy as np
 
+from src.streaming.udp_transport import UdpSegmentReceiver
+
 
 PORT = 9999
 WIDTH, HEIGHT = 640, 480
@@ -519,7 +521,7 @@ def boxes_to_heatmap(boxes_for_wire, frame_shape, heat_w: int, heat_h: int) -> n
     return add_boxes_to_heatmap(heatmap, boxes_for_wire, frame_shape, 255)
 
 
-def send_segment_feedback(conn, segment_id: int, conf: float, heatmap: np.ndarray, boxes_for_wire):
+def make_segment_feedback(segment_id: int, conf: float, heatmap: np.ndarray, boxes_for_wire) -> bytes:
     heat_h, heat_w = heatmap.shape[:2]
     boxes_payload = b"".join(struct.pack("!fffff", *b) for b in boxes_for_wire)
     header = struct.pack(
@@ -530,7 +532,16 @@ def send_segment_feedback(conn, segment_id: int, conf: float, heatmap: np.ndarra
         int(heat_h),
         int(len(boxes_for_wire)),
     )
-    conn.sendall(header + heatmap.tobytes() + boxes_payload)
+    return header + heatmap.tobytes() + boxes_payload
+
+
+def send_segment_feedback(conn, segment_id: int, conf: float, heatmap: np.ndarray, boxes_for_wire):
+    conn.sendall(make_segment_feedback(segment_id, conf, heatmap, boxes_for_wire))
+
+
+def send_segment_feedback_udp(receiver: UdpSegmentReceiver, segment_id: int, conf: float,
+                              heatmap: np.ndarray, boxes_for_wire):
+    receiver.send_feedback(make_segment_feedback(segment_id, conf, heatmap, boxes_for_wire))
 
 
 
@@ -584,6 +595,8 @@ def _parse_args() -> argparse.Namespace:
                    help="Override bind host (config default 0.0.0.0).")
     p.add_argument("--port", type=int, default=None,
                    help="Override port from config.")
+    p.add_argument("--transport", choices=("tcp", "udp"), default=None,
+                   help="Override stream transport.")
     p.add_argument("--width", type=int, default=None,
                    help="Override decoded frame width.")
     p.add_argument("--height", type=int, default=None,
@@ -627,6 +640,7 @@ def _parse_args() -> argparse.Namespace:
     args.save_artifacts = bool(getattr(args, "save_artifacts", False))
     args.output_dir = getattr(args, "output_dir", None)
     args.relay_port = getattr(args, "relay_port", None)
+    args.transport = str(getattr(args, "transport", "tcp") or "tcp").lower()
     args.heatmap_padding_min_pct = float(
         getattr(args, "heatmap_padding_min_pct", 0.08)
     )
@@ -649,6 +663,7 @@ def _parse_args() -> argparse.Namespace:
         "tracker": cli.tracker,
         "host": cli.host,
         "port": cli.port,
+        "transport": cli.transport,
         "width": cli.width,
         "height": cli.height,
         "heatmap_padding_min_pct": cli.heatmap_padding_min_pct,
@@ -709,13 +724,22 @@ def main():
         log.warning("detector warmup skipped: %s", e)
 
     bind_host = getattr(args, "host", None) or "0.0.0.0"
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind((bind_host, args.port))
-    server_socket.listen(1)
+    transport = str(getattr(args, "transport", "tcp") or "tcp").lower()
+    if transport not in ("tcp", "udp"):
+        log.warning("unknown transport=%r; using tcp", transport)
+        transport = "tcp"
+    udp_receiver = None
+    if transport == "udp":
+        server_socket = None
+        udp_receiver = UdpSegmentReceiver(bind_host, args.port)
+    else:
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.bind((bind_host, args.port))
+        server_socket.listen(1)
     log.info(
-        "listening on %s:%d model=%s classes=%s device=%s",
-        bind_host, args.port, args.model, classes, detector.device,
+        "listening on %s:%d transport=%s model=%s classes=%s device=%s",
+        bind_host, args.port, transport, args.model, classes, detector.device,
     )
     log.info(
         "heatmap padding min=%.2f max=%.2f small_area=%.3f large_area=%.3f",
@@ -737,14 +761,23 @@ def main():
                 port=args.relay_port, width=args.width, height=args.height
             )
             relay.start()
-        conn, addr = server_socket.accept()
-        log.info("connection from %s", addr)
-
-        # Receive the camera's actual FPS from the handshake and derive frame duration.
-        fps_bytes = _recv_exact(conn, 4)
-        fps = struct.unpack("!f", fps_bytes)[0]
+        if udp_receiver is not None:
+            fps, addr = udp_receiver.receive_handshake()
+            conn = None
+            log.info("UDP camera handshake from %s", addr)
+        else:
+            conn, addr = server_socket.accept()
+            log.info("connection from %s", addr)
+            # Receive the camera's actual FPS from the handshake and derive frame duration.
+            fps_bytes = _recv_exact(conn, 4)
+            fps = struct.unpack("!f", fps_bytes)[0]
         frame_duration_ms = int(1000 / fps)
-        log.info("FPS handshake received: %.2f  frame_duration_ms=%d", fps, frame_duration_ms)
+        log.info(
+            "FPS handshake received: %.2f  frame_duration_ms=%d transport=%s",
+            fps,
+            frame_duration_ms,
+            transport,
+        )
 
         if getattr(args, "save_artifacts", False):
             artifacts = ServerArtifacts(
@@ -771,6 +804,7 @@ def main():
                 "heatmap_padding_small_area_ratio": args.heatmap_padding_small_area_ratio,
                 "heatmap_padding_large_area_ratio": args.heatmap_padding_large_area_ratio,
                 "client_addr": f"{addr[0]}:{addr[1]}",
+                "transport": transport,
                 "start_wall_time": time.time(),
             })
 
@@ -784,7 +818,12 @@ def main():
         def process_segments():
             while not stop_event.is_set():
                 try:
-                    received = receive_segment(conn)
+                    if udp_receiver is not None:
+                        received = udp_receiver.receive_segment()
+                        if received is None:
+                            continue
+                    else:
+                        received = receive_segment(conn)
                     if received is None:
                         break
 
@@ -792,13 +831,22 @@ def main():
                     frames = _decode_h264_segment(segment_data, args.width, args.height)
                     if not frames:
                         heat_w, heat_h = detector.heatmap_size
-                        send_segment_feedback(
-                            conn,
-                            segment_id,
-                            0.5,
-                            np.zeros((heat_h, heat_w), dtype=np.uint8),
-                            [],
-                        )
+                        if udp_receiver is not None:
+                            send_segment_feedback_udp(
+                                udp_receiver,
+                                segment_id,
+                                0.5,
+                                np.zeros((heat_h, heat_w), dtype=np.uint8),
+                                [],
+                            )
+                        else:
+                            send_segment_feedback(
+                                conn,
+                                segment_id,
+                                0.5,
+                                np.zeros((heat_h, heat_w), dtype=np.uint8),
+                                [],
+                            )
                         continue
 
                     frame_confs = []
@@ -846,13 +894,22 @@ def main():
                             pass
 
                     segment_conf = float(np.percentile(np.array(frame_confs, dtype=np.float32), 50))
-                    send_segment_feedback(
-                        conn,
-                        segment_id,
-                        segment_conf,
-                        segment_heatmap,
-                        latest_boxes_for_wire,
-                    )
+                    if udp_receiver is not None:
+                        send_segment_feedback_udp(
+                            udp_receiver,
+                            segment_id,
+                            segment_conf,
+                            segment_heatmap,
+                            latest_boxes_for_wire,
+                        )
+                    else:
+                        send_segment_feedback(
+                            conn,
+                            segment_id,
+                            segment_conf,
+                            segment_heatmap,
+                            latest_boxes_for_wire,
+                        )
                 except (BrokenPipeError, ConnectionError, OSError, struct.error) as e:
                     log.warning("segment worker stopped: %s", e)
                     break
@@ -909,7 +966,10 @@ def main():
                 conn.close()
             except Exception:
                 pass
-        server_socket.close()
+        if server_socket is not None:
+            server_socket.close()
+        if udp_receiver is not None:
+            udp_receiver.close()
         cv2.destroyAllWindows()
         if relay is not None:
             relay.stop()
