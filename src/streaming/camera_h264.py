@@ -29,6 +29,7 @@ LOG_BANDWIDTH_EVERY_SEC = 10.0
 INITIAL_CRF = 30
 BLUR_LEVELS = {
     "low": {"blur_kernel_size": 5, "low_blur_kernel_size": 9},
+    "medium": {"blur_kernel_size": 11, "low_blur_kernel_size": 25},
     "high": {"blur_kernel_size": 21, "low_blur_kernel_size": 51},
 }
 
@@ -133,6 +134,7 @@ class ConfidenceListener:
         self._crf_value = float(INITIAL_CRF)
         self._crf_integral = 0.0
         self._latest_conf = 0.5
+        self._latest_processing_fps = 0.0
         self._latest_heatmap = None
         self._latest_boxes = []
         self._latest_segment_id = -1
@@ -153,22 +155,25 @@ class ConfidenceListener:
 
     def _listen(self):
         """Receive inference result packets from the server in a loop.
-        Each packet carries (segment_id, conf, heat_w, heat_h, num_boxes) +
-        the heatmap and per-box payloads. The segment_id lets us attribute
+        Each packet carries (segment_id, conf, processing_fps, heat_w, heat_h,
+        num_boxes) + the heatmap and per-box payloads. The segment_id lets us attribute
         the response to the segment it came from rather than treating it as
         an undifferentiated "latest" update.
         """
         while not self._stop.is_set():
             try:
-                header = _recv_exact(self.sock, 14)
-                segment_id, conf, heat_w, heat_h, num_boxes = struct.unpack(
-                    "!IfHHH", header,
+                header = _recv_exact(self.sock, 18)
+                segment_id, conf, processing_fps, heat_w, heat_h, num_boxes = struct.unpack(
+                    "!IffHHH", header,
                 )
                 if not np.isfinite(conf):
                     if self.counters is not None:
                         self.counters.record_invalid_response()
                     continue
                 conf = max(0.0, min(1.0, conf))
+                if not np.isfinite(processing_fps):
+                    processing_fps = 0.0
+                processing_fps = max(0.0, float(processing_fps))
                 segment_id = int(segment_id)
                 heat_w = int(heat_w)
                 heat_h = int(heat_h)
@@ -202,6 +207,7 @@ class ConfidenceListener:
                         oldest = min(self._segment_confidences)
                         self._segment_confidences.pop(oldest, None)
                     self._latest_conf = conf
+                    self._latest_processing_fps = processing_fps
                     self._latest_segment_id = int(segment_id)
                     self._segment_confidences[int(segment_id)] = conf
                     self._next_crf = new_crf
@@ -265,6 +271,10 @@ class ConfidenceListener:
     def latest_confidence(self) -> float:
         with self._lock:
             return float(self._latest_conf)
+
+    def latest_processing_fps(self) -> float:
+        with self._lock:
+            return float(self._latest_processing_fps)
 
     def latest_object_score_map(self):
         with self._lock:
@@ -422,7 +432,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--mask-blur-level", dest="mask_blur_level",
                    choices=sorted(BLUR_LEVELS),
                    default=None,
-                   help="Override mask blur strength: low or high.")
+                   help="Override mask blur strength: low, medium, or high.")
+    p.add_argument("--bandwidth-relay-port", dest="bandwidth_relay_port",
+                   type=int, default=None,
+                   help="If set, send live baseline-vs-adaptive bandwidth samples to the UI.")
 
     cli = p.parse_args()
 
@@ -449,6 +462,7 @@ def _parse_args() -> argparse.Namespace:
         "max_frames": cli.max_frames,
         "response_timeout_sec": cli.response_timeout_sec,
         "mask_blur_level": cli.mask_blur_level,
+        "bandwidth_relay_port": cli.bandwidth_relay_port,
     }
     for key, value in overrides.items():
         if value is not None:
@@ -675,6 +689,74 @@ def main():
     baseline_bw_state = {"sent": 0}
     mode = "Fixed" if FIXED_CRF is not None else "Adaptive"
     crf_transition_count = {"count": 0, "prev": None}
+    bandwidth_relay = None
+    if baseline_socket is not None and getattr(args, "bandwidth_relay_port", None):
+        from src.ui.bandwidth_relay import BandwidthRelaySender
+        bandwidth_relay = BandwidthRelaySender(
+            port=int(args.bandwidth_relay_port),
+        )
+        bandwidth_relay.start()
+
+    segment_bw_lock = threading.Lock()
+    segment_bw_pending = {}
+
+    def record_segment_bandwidth(segment_id, stream, byte_count, frame_count, crf):
+        if bandwidth_relay is None:
+            return
+        sample = None
+        now = time.time()
+        with segment_bw_lock:
+            entry = segment_bw_pending.setdefault(int(segment_id), {})
+            entry[stream] = {
+                "bytes": int(byte_count),
+                "frames": int(frame_count),
+                "crf": int(crf),
+                "wall_time_sec": now,
+            }
+            if "adaptive" in entry and "baseline" in entry:
+                adaptive = entry["adaptive"]
+                baseline = entry["baseline"]
+                segment_bw_pending.pop(int(segment_id), None)
+                duration_sec = max(
+                    max(adaptive["frames"], baseline["frames"]) / max(float(fps), 1.0),
+                    1e-6,
+                )
+                baseline_bytes = max(int(baseline["bytes"]), 0)
+                adaptive_bytes = max(int(adaptive["bytes"]), 0)
+                savings_pct = (
+                    ((baseline_bytes - adaptive_bytes) / baseline_bytes) * 100.0
+                    if baseline_bytes > 0
+                    else 0.0
+                )
+                sample = {
+                    "segment_id": int(segment_id),
+                    "timestamp_sec": now,
+                    "duration_sec": duration_sec,
+                    "fps": float(fps),
+                    "adaptive_bytes": adaptive_bytes,
+                    "baseline_bytes": baseline_bytes,
+                    "adaptive_kbps": (adaptive_bytes * 8.0) / duration_sec / 1000.0,
+                    "baseline_kbps": (baseline_bytes * 8.0) / duration_sec / 1000.0,
+                    "savings_pct": savings_pct,
+                    "adaptive_crf": int(adaptive["crf"]),
+                    "baseline_crf": int(baseline["crf"]),
+                    "adaptive_conf": float(listener.latest_confidence()),
+                    "adaptive_processing_fps": float(listener.latest_processing_fps()),
+                    "baseline_conf": (
+                        float(baseline_listener.latest_confidence())
+                        if baseline_listener is not None else None
+                    ),
+                    "baseline_processing_fps": (
+                        float(baseline_listener.latest_processing_fps())
+                        if baseline_listener is not None else None
+                    ),
+                }
+            if len(segment_bw_pending) > 256:
+                oldest = sorted(segment_bw_pending)[:64]
+                for old_segment_id in oldest:
+                    segment_bw_pending.pop(old_segment_id, None)
+        if sample is not None:
+            bandwidth_relay.send(sample)
 
     log.info(
         "ready input=%s classes=%s preview=%s artifacts=%s",
@@ -793,6 +875,13 @@ def main():
                 bw_state["sent"] += len(data)
                 bw_state["baseline"] += baseline_total
                 masked_bw_samples.append((time.time(), len(data)))
+            record_segment_bandwidth(
+                segment_id,
+                "adaptive",
+                len(data),
+                len(segment_items),
+                crf,
+            )
 
             if getattr(args, "measure_raw_bandwidth", False):
                 # Expensive but accurate: encode raw frames with the same encoder settings.
@@ -874,6 +963,13 @@ def main():
                 last_baseline_crf["crf"] = crf
             with bw_lock:
                 baseline_bw_state["sent"] += len(data)
+            record_segment_bandwidth(
+                segment_id,
+                "baseline",
+                len(data),
+                len(segment_items),
+                crf,
+            )
 
             # Sidecar per-segment row for Streamlit A/B overlay. Wait briefly
             # so the baseline conf logged here is for THIS segment, not the
@@ -1202,6 +1298,11 @@ def main():
         if mirror_sender is not None:
             try:
                 mirror_sender.stop()
+            except Exception:
+                pass
+        if bandwidth_relay is not None:
+            try:
+                bandwidth_relay.stop()
             except Exception:
                 pass
         cv2.destroyAllWindows()

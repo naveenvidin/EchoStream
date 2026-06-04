@@ -12,6 +12,7 @@ Usage:
         loop_video=False,
         classes="person",
         baseline_enabled=True,
+        mask_blur_level="low",
         save_artifacts=True,
         output_dir="runs/my_session",
     )
@@ -32,6 +33,7 @@ def write_runtime_config(
     loop_video: bool,
     classes: str,
     baseline_enabled: bool,
+    mask_blur_level: str,
     save_artifacts: bool,
     output_dir: str | None,
     model: str | None = None,
@@ -54,6 +56,9 @@ def write_runtime_config(
     if save_artifacts and not output_dir:
         output_dir = str(Path("runs") / time.strftime("session_%Y%m%d_%H%M%S"))
     model = (model or "").strip() or None
+    mask_blur_level = str(mask_blur_level or "low").strip().lower()
+    if mask_blur_level not in {"low", "medium", "high"}:
+        raise ValueError("mask_blur_level must be one of: low, medium, high")
 
     # --- camera_h264 overrides ---
     cam = config.setdefault("camera_h264", {})
@@ -63,6 +68,7 @@ def write_runtime_config(
     if model is not None:
         cam["model"] = model
     cam["baseline_enabled"] = baseline_enabled
+    cam["mask_blur_level"] = mask_blur_level
     cam["save_artifacts"] = save_artifacts
     cam["output_dir"] = output_dir if save_artifacts else None
 

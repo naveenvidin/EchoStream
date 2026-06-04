@@ -519,13 +519,21 @@ def boxes_to_heatmap(boxes_for_wire, frame_shape, heat_w: int, heat_h: int) -> n
     return add_boxes_to_heatmap(heatmap, boxes_for_wire, frame_shape, 255)
 
 
-def send_segment_feedback(conn, segment_id: int, conf: float, heatmap: np.ndarray, boxes_for_wire):
+def send_segment_feedback(
+    conn,
+    segment_id: int,
+    conf: float,
+    processing_fps: float,
+    heatmap: np.ndarray,
+    boxes_for_wire,
+):
     heat_h, heat_w = heatmap.shape[:2]
     boxes_payload = b"".join(struct.pack("!fffff", *b) for b in boxes_for_wire)
     header = struct.pack(
-        "!IfHHH",
+        "!IffHHH",
         int(segment_id),
         float(conf),
+        float(processing_fps),
         int(heat_w),
         int(heat_h),
         int(len(boxes_for_wire)),
@@ -780,6 +788,8 @@ def main():
         fps_counter = 0
         fps_timer = time.time()
         current_fps = 0.0
+        fps_lock = threading.Lock()
+        processing_fps_state = {"fps": 0.0}
 
         def process_segments():
             while not stop_event.is_set():
@@ -796,6 +806,7 @@ def main():
                             conn,
                             segment_id,
                             0.5,
+                            0.0,
                             np.zeros((heat_h, heat_w), dtype=np.uint8),
                             [],
                         )
@@ -815,7 +826,7 @@ def main():
                             person_cls_idx,
                         )
                         if boxes_for_wire:
-                            conf = float(min(b[4] for b in boxes_for_wire))
+                            conf = np.mean([b[4] for b in boxes_for_wire])
                             latest_boxes_for_wire = boxes_for_wire
 
                         frame_confs.append(float(conf))
@@ -846,10 +857,13 @@ def main():
                             pass
 
                     segment_conf = float(np.percentile(np.array(frame_confs, dtype=np.float32), 50))
+                    with fps_lock:
+                        processing_fps = float(processing_fps_state["fps"])
                     send_segment_feedback(
                         conn,
                         segment_id,
                         segment_conf,
+                        processing_fps,
                         segment_heatmap,
                         latest_boxes_for_wire,
                     )
@@ -875,6 +889,8 @@ def main():
             fps_counter += 1
             if time.time() - fps_timer >= 1.0:
                 current_fps = fps_counter / max(time.time() - fps_timer, 1e-6)
+                with fps_lock:
+                    processing_fps_state["fps"] = float(current_fps)
                 fps_counter = 0
                 fps_timer = time.time()
 
