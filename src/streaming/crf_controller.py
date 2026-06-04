@@ -22,6 +22,7 @@ class EmaProbeCrfController:
         crf_min: int,
         crf_max: int,
         initial_crf: int,
+        crf_reset: int
     ):
         self.target = float(target)
         self.margin = float(margin)
@@ -31,6 +32,7 @@ class EmaProbeCrfController:
         self.probe_interval = max(1, int(probe_interval))
         self.crf_min = int(crf_min)
         self.crf_max = int(crf_max)
+        self.crf_reset = int(crf_reset)
 
         self._crf_value = float(initial_crf)
         self._smoothed_conf = None
@@ -38,7 +40,7 @@ class EmaProbeCrfController:
 
     def update(self, conf: float, has_detection: bool = True) -> int:
         if not has_detection:
-            self._crf_value = float(self.crf_max)
+            self._crf_value = float(self.crf_reset)
             self._smoothed_conf = 1.0
             self._probe_wait = 0
             return int(round(self._crf_value))

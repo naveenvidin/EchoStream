@@ -551,6 +551,7 @@ def main():
             crf_min=int(getattr(args, "crf_min", 23)),
             crf_max=int(getattr(args, "crf_max", 43)),
             initial_crf=INITIAL_CRF,
+            crf_reset=int(getattr(args, "crf_reset", 30))
         )
 
     controller = _build_controller()
