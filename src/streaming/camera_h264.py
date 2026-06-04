@@ -26,7 +26,7 @@ PORT = 9999
 FIXED_CRF = None
 WIDTH, HEIGHT = 640, 480
 LOG_BANDWIDTH_EVERY_SEC = 10.0
-INITIAL_CRF = 30
+INITIAL_CRF = 23
 BLUR_LEVELS = {
     "low": {"blur_kernel_size": 5, "low_blur_kernel_size": 9},
     "medium": {"blur_kernel_size": 11, "low_blur_kernel_size": 25},

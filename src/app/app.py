@@ -349,11 +349,20 @@ class ConfigScreen(tk.Frame):
         ttk.Separator(self, orient="horizontal").grid(
             row=14, column=0, columnspan=3, sticky="ew", pady=16
         )
-        tk.Button(
-            self, text="Start", font=("Helvetica", 13, "bold"),
-            bg="#2d7d46", fg="white", padx=20, pady=8,
-            command=self._start
-        ).grid(row=15, column=0, sticky="w")
+        start_btn = tk.Label(
+            self,
+            text="Start",
+            font=("Helvetica", 13, "bold"),
+            bg="#2ecc71",
+            fg="white",
+            padx=20,
+            pady=8,
+            cursor="hand2",
+        )
+        start_btn.bind("<Button-1>", lambda e: self._start())
+        start_btn.bind("<Enter>", lambda e: start_btn.config(bg="#27ae60"))
+        start_btn.bind("<Leave>", lambda e: start_btn.config(bg="#2ecc71"))
+        start_btn.grid(row=15, column=0, sticky="w")
 
     # --- event handlers ---
 
@@ -487,7 +496,7 @@ class RunningScreen(tk.Frame):
                 row=2, column=1, pady=(0, 4)
             )
             self._baseline_panel = tk.Label(self, image=self._blank, bg="black")
-            self._baseline_panel.grid(row=3, column=1, sticky="nsew")
+            self._baseline_panel.grid(row=3, column=1, padx=(8, 0), sticky="nsew")
         else:
             self._baseline_panel = None
 
@@ -523,11 +532,20 @@ class RunningScreen(tk.Frame):
         )
 
         # Stop button
-        tk.Button(
-            self, text="Stop", font=("Helvetica", 12, "bold"),
-            bg="#c0392b", fg="white", padx=16, pady=6,
-            command=self._stop
-        ).grid(row=6, column=0, sticky="w", pady=(4, 0))
+        stop_btn = tk.Label(
+            self,
+            text="Stop",
+            font=("Helvetica", 12, "bold"),
+            bg="#e74c3c",
+            fg="white",
+            padx=16,
+            pady=6,
+            cursor="hand2",
+        )
+        stop_btn.bind("<Button-1>", lambda e: self._stop())
+        stop_btn.bind("<Enter>", lambda e: stop_btn.config(bg="#c0392b"))
+        stop_btn.bind("<Leave>", lambda e: stop_btn.config(bg="#e74c3c"))
+        stop_btn.grid(row=6, column=0, sticky="w", pady=(4, 0))
 
     def _poll_frames(self):
         """Called by Tkinter's after() loop — updates panels with latest frames."""
@@ -554,14 +572,21 @@ class RunningScreen(tk.Frame):
         if frame is None:
             return
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # Get actual panel dimensions; fall back to PANEL_W/PANEL_H if not yet rendered
-        panel_width = panel.winfo_width()
-        panel_height = panel.winfo_height()
-        if panel_width <= 1 or panel_height <= 1:
-            panel_width, panel_height = PANEL_W, PANEL_H
-        
-        img = Image.fromarray(rgb).resize((panel_width, panel_height), Image.LANCZOS)
+        # Compute target width so adaptive and baseline panels are equal
+        if self._baseline_enabled and self._baseline_panel is not None:
+            total_w = self.winfo_width()
+            # fallback to default sizes if window not yet realized
+            if total_w <= 1:
+                panel_w = PANEL_W
+            else:
+                gap = 16  # approximate total horizontal gap between columns
+                panel_w = max(1, int((total_w - gap) / 2))
+        else:
+            panel_w = panel.winfo_width() or PANEL_W
+
+        panel_h = panel.winfo_height() or PANEL_H
+
+        img = Image.fromarray(rgb).resize((panel_w, panel_h), Image.LANCZOS)
         photo = ImageTk.PhotoImage(img)
         panel.configure(image=photo)
         panel.image = photo  # prevent GC
@@ -748,7 +773,7 @@ class RunningScreen(tk.Frame):
         metrics = [
             ("bandwidth_saved_pct", "Bandwidth Saved", "#f59e0b"),
             ("crf", "Adaptive CRF", "#38bdf8"),
-            ("avg_conf", "Avg. Confidence", "#34d399"),
+            ("conf_error", "Conf Error (%)", "#34d399"),
             ("processing_fps", "Processing FPS", "#f472b6"),
         ]
         for col, (key, label, accent) in enumerate(metrics):
@@ -816,7 +841,30 @@ class RunningScreen(tk.Frame):
         self._metric_vars["bandwidth_saved_pct"].set(f"{bandwidth_saved_pct:.1f}%")
         adaptive_crf = int(latest.get("adaptive_crf", 0))
         self._metric_vars["crf"].set(str(adaptive_crf))
-        self._metric_vars["avg_conf"].set(f"{avg_conf:.3f}")
+
+        # Compute baseline (raw) average confidence from recent samples, if available
+        avg_baseline_conf = None
+        if self._baseline_enabled:
+            conf_sum = 0.0
+            conf_count = 0
+            for s in samples:
+                b = s.get("baseline_conf")
+                if b is None:
+                    continue
+                try:
+                    conf_sum += float(b)
+                    conf_count += 1
+                except (TypeError, ValueError):
+                    continue
+            if conf_count > 0:
+                avg_baseline_conf = conf_sum / conf_count
+
+        if avg_baseline_conf is None or avg_baseline_conf == 0.0:
+            self._metric_vars["conf_error"].set("--")
+        else:
+            # Absolute percentage difference relative to raw baseline confidence
+            error_pct = abs(avg_conf - avg_baseline_conf) / avg_baseline_conf * 100.0
+            self._metric_vars["conf_error"].set(f"{error_pct:.1f}%")
         self._metric_vars["processing_fps"].set(
             f"{float(latest.get('adaptive_processing_fps', 0.0)):.1f}"
         )
