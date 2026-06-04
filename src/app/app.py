@@ -449,6 +449,8 @@ class RunningScreen(tk.Frame):
             "baseline_bytes": 0.0,
             "conf_sum": 0.0,
             "conf_count": 0,
+            "preserved_detections": 0.0,
+            "baseline_detections": 0.0,
         }
         self._metric_vars: dict[str, tk.StringVar] = {}
         self._adaptive_title_var = tk.StringVar(value="Adaptive (StreamSense)")
@@ -769,11 +771,13 @@ class RunningScreen(tk.Frame):
         panel.grid_columnconfigure(1, weight=1)
         panel.grid_columnconfigure(2, weight=1)
         panel.grid_columnconfigure(3, weight=1)
+        panel.grid_columnconfigure(4, weight=1)
 
         metrics = [
             ("bandwidth_saved_pct", "Bandwidth Saved", "#f59e0b"),
             ("crf", "Adaptive CRF", "#38bdf8"),
             ("conf_error", "Conf Error (%)", "#34d399"),
+            ("preservation_pct", "Preservation (%)", "#10b981"),
             ("processing_fps", "Processing FPS", "#f472b6"),
         ]
         for col, (key, label, accent) in enumerate(metrics):
@@ -810,6 +814,12 @@ class RunningScreen(tk.Frame):
         )
         self._bandwidth_totals["baseline_bytes"] += float(
             sample.get("baseline_bytes", 0.0)
+        )
+        self._bandwidth_totals["baseline_detections"] += float(
+            sample.get("baseline_detection_count", 0.0)
+        )
+        self._bandwidth_totals["preserved_detections"] += float(
+            sample.get("preserved_detection_count", 0.0)
         )
         conf = sample.get("adaptive_conf")
         if conf is not None:
@@ -865,6 +875,15 @@ class RunningScreen(tk.Frame):
             # Absolute percentage difference relative to raw baseline confidence
             error_pct = abs(avg_conf - avg_baseline_conf) / avg_baseline_conf * 100.0
             self._metric_vars["conf_error"].set(f"{error_pct:.1f}%")
+
+        baseline_detections = float(self._bandwidth_totals.get("baseline_detections", 0.0))
+        preserved_detections = float(self._bandwidth_totals.get("preserved_detections", 0.0))
+        if baseline_detections > 0:
+            preservation_pct = preserved_detections / baseline_detections * 100.0
+            self._metric_vars["preservation_pct"].set(f"{preservation_pct:.1f}%")
+        else:
+            self._metric_vars["preservation_pct"].set("--")
+
         self._metric_vars["processing_fps"].set(
             f"{float(latest.get('adaptive_processing_fps', 0.0)):.1f}"
         )

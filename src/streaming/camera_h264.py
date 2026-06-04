@@ -303,6 +303,47 @@ def _recv_exact(sock: socket.socket, size: int) -> bytes:
     return b"".join(chunks)
 
 
+def _iou_xyxy(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    if a.size == 0 or b.size == 0:
+        return np.zeros((a.shape[0], b.shape[0]), dtype=np.float32)
+    ax1, ay1, ax2, ay2 = a[:, 0:1], a[:, 1:2], a[:, 2:3], a[:, 3:4]
+    bx1, by1, bx2, by2 = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
+    ix1 = np.maximum(ax1, bx1)
+    iy1 = np.maximum(ay1, by1)
+    ix2 = np.minimum(ax2, bx2)
+    iy2 = np.minimum(ay2, by2)
+    iw = np.clip(ix2 - ix1, 0, None)
+    ih = np.clip(iy2 - iy1, 0, None)
+    inter = iw * ih
+    area_a = np.clip(ax2 - ax1, 0, None) * np.clip(ay2 - ay1, 0, None)
+    area_b = np.clip(bx2 - bx1, 0, None) * np.clip(by2 - by1, 0, None)
+    union = area_a + area_b - inter
+    return np.where(union > 0, inter / union, 0.0).astype(np.float32)
+
+
+def _greedy_match(iou: np.ndarray, threshold: float):
+    if iou.size == 0:
+        return [], list(range(iou.shape[0])), list(range(iou.shape[1]))
+    matches = []
+    used_ref = set()
+    used_cand = set()
+    flat = [
+        (float(iou[r, c]), r, c)
+        for r in range(iou.shape[0]) for c in range(iou.shape[1])
+        if iou[r, c] >= threshold
+    ]
+    flat.sort(reverse=True)
+    for i, r, c in flat:
+        if r in used_ref or c in used_cand:
+            continue
+        used_ref.add(r)
+        used_cand.add(c)
+        matches.append((r, c, i))
+    unmatched_ref = [r for r in range(iou.shape[0]) if r not in used_ref]
+    unmatched_cand = [c for c in range(iou.shape[1]) if c not in used_cand]
+    return matches, unmatched_ref, unmatched_cand
+
+
 def estimate_baseline_bytes(frame: np.ndarray, crf: int) -> int:
     """Per-frame JPEG size estimator used as the denominator of the
     `[BW] saved=...%` log line.
@@ -755,6 +796,29 @@ def main():
                         if baseline_listener is not None else None
                     ),
                 }
+                if baseline_listener is not None:
+                    adaptive_boxes = listener.latest_boxes()
+                    baseline_boxes = baseline_listener.latest_boxes()
+                    sample["adaptive_detection_count"] = len(adaptive_boxes)
+                    sample["baseline_detection_count"] = len(baseline_boxes)
+                    if baseline_boxes:
+                        ref_boxes = np.array([b[:4] for b in baseline_boxes], dtype=np.float32)
+                        cand_boxes = np.array([b[:4] for b in adaptive_boxes], dtype=np.float32)
+                        iou = _iou_xyxy(ref_boxes, cand_boxes)
+                        matches, _, _ = _greedy_match(iou, 0.25)
+                        preserved = len(matches)
+                        sample["preserved_detection_count"] = preserved
+                        sample["preservation_pct"] = (
+                            float(preserved) / len(baseline_boxes) * 100.0
+                        )
+                    else:
+                        sample["preserved_detection_count"] = 0
+                        sample["preservation_pct"] = 100.0
+                else:
+                    sample["adaptive_detection_count"] = len(listener.latest_boxes())
+                    sample["baseline_detection_count"] = 0
+                    sample["preserved_detection_count"] = 0
+                    sample["preservation_pct"] = None
             if len(segment_bw_pending) > 256:
                 oldest = sorted(segment_bw_pending)[:64]
                 for old_segment_id in oldest:
