@@ -805,7 +805,7 @@ def main():
                         send_segment_feedback(
                             conn,
                             segment_id,
-                            0.5,
+                            0.0,
                             0.0,
                             np.zeros((heat_h, heat_w), dtype=np.uint8),
                             [],
@@ -828,6 +828,8 @@ def main():
                         if boxes_for_wire:
                             conf = np.mean([b[4] for b in boxes_for_wire])
                             latest_boxes_for_wire = boxes_for_wire
+                        else:
+                            conf = 0.0
 
                         frame_confs.append(float(conf))
                         add_boxes_to_heatmap(

@@ -196,7 +196,10 @@ class ConfidenceListener:
                         x1, y1, x2, y2, c = struct.unpack("!fffff", box_bytes[off:off + 20])
                         boxes.append((x1, y1, x2, y2, c))
 
-                new_crf = self._controller.update(conf)
+                new_crf = self._controller.update(
+                    conf,
+                    has_detection=(num_boxes > 0),
+                )
                 event_to_set = None
                 with self._lock:
                     frame_count = self._pending_segments.pop(segment_id, None)
