@@ -147,6 +147,26 @@ Camera flags:
 python -m src.streaming.camera_h264 --input runs/live_001/raw_recorded_input.mp4 --classes "person,wallet,bed" --save-artifacts --output-dir runs/replay_001
 ```
 
+## 2b. Run the local Tkinter demo UI (GUI)
+
+The project includes a small Tkinter-based demo UI that can launch and monitor a local compare run. It listens for two frame-relay ports and a bandwidth relay port (see `src/app/app.py` for defaults).
+
+Run the GUI from the repository root (activate your virtualenv first):
+
+```bash
+python -m src.app.app
+```
+
+Notes:
+
+- The UI expects the camera/server processes to use these default ports unless overridden in the config:
+  - adaptive server → `9999` (server) → UI relay client `9997`
+  - baseline server → `9998` (server) → UI relay client `9996`
+  - bandwidth relay (camera → UI): `9995`
+- If you launch the GUI and it cannot connect to relays yet, it will retry until the camera and server are up.
+- The Streamlit evaluator remains useful for post-run analysis; the Tkinter GUI is a live-control/preview tool.
+
+
 Start the server first, using the same prompted classes:
 
 ```powershell

@@ -69,7 +69,7 @@ class KalmanPersonTracker:
     def __init__(
         self,
         iou_threshold: float = 0.3,
-        max_age: int = 10,
+        max_age: int = 15,
     ):
         self.iou_threshold = float(iou_threshold)
         self.max_age = int(max_age)

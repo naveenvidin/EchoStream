@@ -30,9 +30,10 @@
     "crf_ema_alpha": 0.30,
     "crf_up_step": 1,
     "crf_down_step": 2,
-    "crf_probe_interval": 3,
+    "crf_probe_interval": 10,
     "crf_min": 23,
-    "crf_max": 43
+    "crf_max": 43,
+    "crf_reset":30
   },
   "server_h264": {
     "tracker": "kalman",

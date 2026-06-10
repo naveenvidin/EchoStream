@@ -26,9 +26,10 @@ PORT = 9999
 FIXED_CRF = None
 WIDTH, HEIGHT = 640, 480
 LOG_BANDWIDTH_EVERY_SEC = 10.0
-INITIAL_CRF = 30
+INITIAL_CRF = 23
 BLUR_LEVELS = {
     "low": {"blur_kernel_size": 5, "low_blur_kernel_size": 9},
+    "medium": {"blur_kernel_size": 11, "low_blur_kernel_size": 25},
     "high": {"blur_kernel_size": 21, "low_blur_kernel_size": 51},
 }
 
@@ -133,6 +134,7 @@ class ConfidenceListener:
         self._crf_value = float(INITIAL_CRF)
         self._crf_integral = 0.0
         self._latest_conf = 0.5
+        self._latest_processing_fps = 0.0
         self._latest_heatmap = None
         self._latest_boxes = []
         self._latest_segment_id = -1
@@ -153,22 +155,25 @@ class ConfidenceListener:
 
     def _listen(self):
         """Receive inference result packets from the server in a loop.
-        Each packet carries (segment_id, conf, heat_w, heat_h, num_boxes) +
-        the heatmap and per-box payloads. The segment_id lets us attribute
+        Each packet carries (segment_id, conf, processing_fps, heat_w, heat_h,
+        num_boxes) + the heatmap and per-box payloads. The segment_id lets us attribute
         the response to the segment it came from rather than treating it as
         an undifferentiated "latest" update.
         """
         while not self._stop.is_set():
             try:
-                header = _recv_exact(self.sock, 14)
-                segment_id, conf, heat_w, heat_h, num_boxes = struct.unpack(
-                    "!IfHHH", header,
+                header = _recv_exact(self.sock, 18)
+                segment_id, conf, processing_fps, heat_w, heat_h, num_boxes = struct.unpack(
+                    "!IffHHH", header,
                 )
                 if not np.isfinite(conf):
                     if self.counters is not None:
                         self.counters.record_invalid_response()
                     continue
                 conf = max(0.0, min(1.0, conf))
+                if not np.isfinite(processing_fps):
+                    processing_fps = 0.0
+                processing_fps = max(0.0, float(processing_fps))
                 segment_id = int(segment_id)
                 heat_w = int(heat_w)
                 heat_h = int(heat_h)
@@ -191,7 +196,10 @@ class ConfidenceListener:
                         x1, y1, x2, y2, c = struct.unpack("!fffff", box_bytes[off:off + 20])
                         boxes.append((x1, y1, x2, y2, c))
 
-                new_crf = self._controller.update(conf)
+                new_crf = self._controller.update(
+                    conf,
+                    has_detection=(num_boxes > 0),
+                )
                 event_to_set = None
                 with self._lock:
                     frame_count = self._pending_segments.pop(segment_id, None)
@@ -202,6 +210,7 @@ class ConfidenceListener:
                         oldest = min(self._segment_confidences)
                         self._segment_confidences.pop(oldest, None)
                     self._latest_conf = conf
+                    self._latest_processing_fps = processing_fps
                     self._latest_segment_id = int(segment_id)
                     self._segment_confidences[int(segment_id)] = conf
                     self._next_crf = new_crf
@@ -266,6 +275,10 @@ class ConfidenceListener:
         with self._lock:
             return float(self._latest_conf)
 
+    def latest_processing_fps(self) -> float:
+        with self._lock:
+            return float(self._latest_processing_fps)
+
     def latest_object_score_map(self):
         with self._lock:
             return None if self._latest_heatmap is None else self._latest_heatmap.copy()
@@ -288,6 +301,47 @@ def _recv_exact(sock: socket.socket, size: int) -> bytes:
         chunks.append(chunk)
         received += len(chunk)
     return b"".join(chunks)
+
+
+def _iou_xyxy(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    if a.size == 0 or b.size == 0:
+        return np.zeros((a.shape[0], b.shape[0]), dtype=np.float32)
+    ax1, ay1, ax2, ay2 = a[:, 0:1], a[:, 1:2], a[:, 2:3], a[:, 3:4]
+    bx1, by1, bx2, by2 = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
+    ix1 = np.maximum(ax1, bx1)
+    iy1 = np.maximum(ay1, by1)
+    ix2 = np.minimum(ax2, bx2)
+    iy2 = np.minimum(ay2, by2)
+    iw = np.clip(ix2 - ix1, 0, None)
+    ih = np.clip(iy2 - iy1, 0, None)
+    inter = iw * ih
+    area_a = np.clip(ax2 - ax1, 0, None) * np.clip(ay2 - ay1, 0, None)
+    area_b = np.clip(bx2 - bx1, 0, None) * np.clip(by2 - by1, 0, None)
+    union = area_a + area_b - inter
+    return np.where(union > 0, inter / union, 0.0).astype(np.float32)
+
+
+def _greedy_match(iou: np.ndarray, threshold: float):
+    if iou.size == 0:
+        return [], list(range(iou.shape[0])), list(range(iou.shape[1]))
+    matches = []
+    used_ref = set()
+    used_cand = set()
+    flat = [
+        (float(iou[r, c]), r, c)
+        for r in range(iou.shape[0]) for c in range(iou.shape[1])
+        if iou[r, c] >= threshold
+    ]
+    flat.sort(reverse=True)
+    for i, r, c in flat:
+        if r in used_ref or c in used_cand:
+            continue
+        used_ref.add(r)
+        used_cand.add(c)
+        matches.append((r, c, i))
+    unmatched_ref = [r for r in range(iou.shape[0]) if r not in used_ref]
+    unmatched_cand = [c for c in range(iou.shape[1]) if c not in used_cand]
+    return matches, unmatched_ref, unmatched_cand
 
 
 def estimate_baseline_bytes(frame: np.ndarray, crf: int) -> int:
@@ -422,7 +476,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--mask-blur-level", dest="mask_blur_level",
                    choices=sorted(BLUR_LEVELS),
                    default=None,
-                   help="Override mask blur strength: low or high.")
+                   help="Override mask blur strength: low, medium, or high.")
+    p.add_argument("--bandwidth-relay-port", dest="bandwidth_relay_port",
+                   type=int, default=None,
+                   help="If set, send live baseline-vs-adaptive bandwidth samples to the UI.")
 
     cli = p.parse_args()
 
@@ -449,6 +506,7 @@ def _parse_args() -> argparse.Namespace:
         "max_frames": cli.max_frames,
         "response_timeout_sec": cli.response_timeout_sec,
         "mask_blur_level": cli.mask_blur_level,
+        "bandwidth_relay_port": cli.bandwidth_relay_port,
     }
     for key, value in overrides.items():
         if value is not None:
@@ -534,6 +592,7 @@ def main():
             crf_min=int(getattr(args, "crf_min", 23)),
             crf_max=int(getattr(args, "crf_max", 43)),
             initial_crf=INITIAL_CRF,
+            crf_reset=int(getattr(args, "crf_reset", 30))
         )
 
     controller = _build_controller()
@@ -675,6 +734,97 @@ def main():
     baseline_bw_state = {"sent": 0}
     mode = "Fixed" if FIXED_CRF is not None else "Adaptive"
     crf_transition_count = {"count": 0, "prev": None}
+    bandwidth_relay = None
+    if baseline_socket is not None and getattr(args, "bandwidth_relay_port", None):
+        from src.ui.bandwidth_relay import BandwidthRelaySender
+        bandwidth_relay = BandwidthRelaySender(
+            port=int(args.bandwidth_relay_port),
+        )
+        bandwidth_relay.start()
+
+    segment_bw_lock = threading.Lock()
+    segment_bw_pending = {}
+
+    def record_segment_bandwidth(segment_id, stream, byte_count, frame_count, crf):
+        if bandwidth_relay is None:
+            return
+        sample = None
+        now = time.time()
+        with segment_bw_lock:
+            entry = segment_bw_pending.setdefault(int(segment_id), {})
+            entry[stream] = {
+                "bytes": int(byte_count),
+                "frames": int(frame_count),
+                "crf": int(crf),
+                "wall_time_sec": now,
+            }
+            if "adaptive" in entry and "baseline" in entry:
+                adaptive = entry["adaptive"]
+                baseline = entry["baseline"]
+                segment_bw_pending.pop(int(segment_id), None)
+                duration_sec = max(
+                    max(adaptive["frames"], baseline["frames"]) / max(float(fps), 1.0),
+                    1e-6,
+                )
+                baseline_bytes = max(int(baseline["bytes"]), 0)
+                adaptive_bytes = max(int(adaptive["bytes"]), 0)
+                savings_pct = (
+                    ((baseline_bytes - adaptive_bytes) / baseline_bytes) * 100.0
+                    if baseline_bytes > 0
+                    else 0.0
+                )
+                sample = {
+                    "segment_id": int(segment_id),
+                    "timestamp_sec": now,
+                    "duration_sec": duration_sec,
+                    "fps": float(fps),
+                    "adaptive_bytes": adaptive_bytes,
+                    "baseline_bytes": baseline_bytes,
+                    "adaptive_kbps": (adaptive_bytes * 8.0) / duration_sec / 1000.0,
+                    "baseline_kbps": (baseline_bytes * 8.0) / duration_sec / 1000.0,
+                    "savings_pct": savings_pct,
+                    "adaptive_crf": int(adaptive["crf"]),
+                    "baseline_crf": int(baseline["crf"]),
+                    "adaptive_conf": float(listener.latest_confidence()),
+                    "adaptive_processing_fps": float(listener.latest_processing_fps()),
+                    "baseline_conf": (
+                        float(baseline_listener.latest_confidence())
+                        if baseline_listener is not None else None
+                    ),
+                    "baseline_processing_fps": (
+                        float(baseline_listener.latest_processing_fps())
+                        if baseline_listener is not None else None
+                    ),
+                }
+                if baseline_listener is not None:
+                    adaptive_boxes = listener.latest_boxes()
+                    baseline_boxes = baseline_listener.latest_boxes()
+                    sample["adaptive_detection_count"] = len(adaptive_boxes)
+                    sample["baseline_detection_count"] = len(baseline_boxes)
+                    if baseline_boxes:
+                        ref_boxes = np.array([b[:4] for b in baseline_boxes], dtype=np.float32)
+                        cand_boxes = np.array([b[:4] for b in adaptive_boxes], dtype=np.float32)
+                        iou = _iou_xyxy(ref_boxes, cand_boxes)
+                        matches, _, _ = _greedy_match(iou, 0.25)
+                        preserved = len(matches)
+                        sample["preserved_detection_count"] = preserved
+                        sample["preservation_pct"] = (
+                            float(preserved) / len(baseline_boxes) * 100.0
+                        )
+                    else:
+                        sample["preserved_detection_count"] = 0
+                        sample["preservation_pct"] = 100.0
+                else:
+                    sample["adaptive_detection_count"] = len(listener.latest_boxes())
+                    sample["baseline_detection_count"] = 0
+                    sample["preserved_detection_count"] = 0
+                    sample["preservation_pct"] = None
+            if len(segment_bw_pending) > 256:
+                oldest = sorted(segment_bw_pending)[:64]
+                for old_segment_id in oldest:
+                    segment_bw_pending.pop(old_segment_id, None)
+        if sample is not None:
+            bandwidth_relay.send(sample)
 
     log.info(
         "ready input=%s classes=%s preview=%s artifacts=%s",
@@ -793,6 +943,13 @@ def main():
                 bw_state["sent"] += len(data)
                 bw_state["baseline"] += baseline_total
                 masked_bw_samples.append((time.time(), len(data)))
+            record_segment_bandwidth(
+                segment_id,
+                "adaptive",
+                len(data),
+                len(segment_items),
+                crf,
+            )
 
             if getattr(args, "measure_raw_bandwidth", False):
                 # Expensive but accurate: encode raw frames with the same encoder settings.
@@ -874,6 +1031,13 @@ def main():
                 last_baseline_crf["crf"] = crf
             with bw_lock:
                 baseline_bw_state["sent"] += len(data)
+            record_segment_bandwidth(
+                segment_id,
+                "baseline",
+                len(data),
+                len(segment_items),
+                crf,
+            )
 
             # Sidecar per-segment row for Streamlit A/B overlay. Wait briefly
             # so the baseline conf logged here is for THIS segment, not the
@@ -1202,6 +1366,11 @@ def main():
         if mirror_sender is not None:
             try:
                 mirror_sender.stop()
+            except Exception:
+                pass
+        if bandwidth_relay is not None:
+            try:
+                bandwidth_relay.stop()
             except Exception:
                 pass
         cv2.destroyAllWindows()
